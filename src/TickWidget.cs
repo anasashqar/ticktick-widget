@@ -1714,14 +1714,14 @@ namespace AnasTick
         }
 
         // تجربة من قائمة الأيقونة
-        public void TestAlarm()
+        public void TestAlarm(string title = "تجربة المنبه")
         {
             // تنبيه وهمي: ما بيرتبط بأي مهمة حقيقية، فزر "خلصت" ما بيكمّل شي
             string at = Util.Stamp(DateTime.Now);
             var key = "__test__|" + at;
             silenced.Remove(key); rung.Remove(key);
             RemovePending("__test__");
-            st.Pending.Add(new PendingAlert { TaskId = "__test__", Title = "تجربة المنبه", At = at, Missed = false });
+            st.Pending.Add(new PendingAlert { TaskId = "__test__", Title = title, At = at, Missed = false });
             st.Save();
             lastSig = null;
             Render();
@@ -2316,6 +2316,7 @@ namespace AnasTick
         // --panel=quick|settings|list من سطر الأوامر (للاختبار والاختصارات)
         public void OpenPanel(string name)
         {
+            if (name.StartsWith("ring|")) { TestAlarm(name.Substring(5)); return; }
             if (name.StartsWith("alarm|")) { QuickFromText(name.Substring(6)); return; }
             if (name.StartsWith("rename|"))
             {
@@ -2699,6 +2700,7 @@ namespace AnasTick
             bool testAlarm = args.Contains("--test-alarm");
             string panelArg = args.FirstOrDefault(a => a.StartsWith("--panel="));
             string alarmArg = args.FirstOrDefault(a => a.StartsWith("--alarm="));
+            string ringArg = args.FirstOrDefault(a => a.StartsWith("--ring="));
             string renameArg = args.FirstOrDefault(a => a.StartsWith("--rename="));
 
             bool created;
@@ -2713,7 +2715,8 @@ namespace AnasTick
             }
             if (!created)
             {
-                if (renameArg != null) { try { File.WriteAllText(Util.P("panel.req"), "rename|" + renameArg.Substring(9), new UTF8Encoding(false)); } catch { } panelEvt.Set(); }
+                if (ringArg != null) { try { File.WriteAllText(Util.P("panel.req"), "ring|" + ringArg.Substring(7), new UTF8Encoding(false)); } catch { } panelEvt.Set(); }
+                else if (renameArg != null) { try { File.WriteAllText(Util.P("panel.req"), "rename|" + renameArg.Substring(9), new UTF8Encoding(false)); } catch { } panelEvt.Set(); }
                 else if (alarmArg != null) { try { File.WriteAllText(Util.P("panel.req"), "alarm|" + alarmArg.Substring(8), new UTF8Encoding(false)); } catch { } panelEvt.Set(); }
                 else if (panelArg != null) { try { File.WriteAllText(Util.P("panel.req"), panelArg.Substring(8)); } catch { } panelEvt.Set(); }
                 else if (testAlarm) testEvt.Set();       // تجربة المنبه على النسخة الشغالة
