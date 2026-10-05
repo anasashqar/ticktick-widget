@@ -6,5 +6,3 @@ error.log
 *.tmp
 TickWidget.exe
 attachments/
-legacy/reminders.json
-legacy/widget-state.json
