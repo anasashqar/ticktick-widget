@@ -1,0 +1,10 @@
+ticktick.secret.json
+token.dat
+state.json
+cache.json
+error.log
+*.tmp
+TickWidget.exe
+attachments/
+legacy/reminders.json
+legacy/widget-state.json
