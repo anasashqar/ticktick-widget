@@ -522,6 +522,17 @@ namespace AnasTick
         [DllImport("user32.dll", EntryPoint = "SetWindowLongPtr")] static extern IntPtr SetWindowLongPtr64(IntPtr h, int i, IntPtr v);
         [DllImport("psapi.dll")] static extern bool EmptyWorkingSet(IntPtr h);
 
+        [StructLayout(LayoutKind.Sequential)]
+        struct MEMORYSTATUSEX { public uint dwLength, dwMemoryLoad; public ulong ullTotalPhys, ullAvailPhys, ullTotalPageFile, ullAvailPageFile, ullTotalVirtual, ullAvailVirtual, ullAvailExtendedVirtual; }
+        [DllImport("kernel32.dll")] static extern bool GlobalMemoryStatusEx(ref MEMORYSTATUSEX m);
+
+        // الذاكرة (RAM + ملف التبديل) المتبقية بالنظام، بالـ MB
+        public static long FreeCommitMB()
+        {
+            var m = new MEMORYSTATUSEX { dwLength = (uint)Marshal.SizeOf(typeof(MEMORYSTATUSEX)) };
+            return GlobalMemoryStatusEx(ref m) ? (long)(m.ullAvailPageFile / (1024 * 1024)) : long.MaxValue;
+        }
+
         public static IntPtr GetLong(IntPtr h, int i) { return IntPtr.Size == 8 ? GetWindowLongPtr64(h, i) : new IntPtr(GetWindowLong32(h, i)); }
         public static void SetLong(IntPtr h, int i, IntPtr v) { if (IntPtr.Size == 8) SetWindowLongPtr64(h, i, v); else SetWindowLong32(h, i, v.ToInt32()); }
 
@@ -1668,7 +1679,8 @@ namespace AnasTick
 
             if (alarmWin == null)
             {
-                alarmWin = new AlarmWindow();
+                try { alarmWin = new AlarmWindow(); }
+                catch (Exception ex) { Util.Log("alarm window: " + ex.Message); alarmWin = null; NotifyFallback(); AlarmSound.Start(cfg); return; }
                 alarmWin.OnDone = p => { var t = FindTask(p.TaskId); RemovePending(p.TaskId); st.Save(); if (t != null) ToggleComplete(t); else Render(); };
                 alarmWin.OnSnooze = (p, at) => Snooze(p.TaskId, at);
                 alarmWin.OnDismiss = () =>
@@ -1684,6 +1696,7 @@ namespace AnasTick
             foreach (var p in active) if (rung.Add(AKey(p))) fresh = true;
             if (fresh)
             {
+                if (Native.FreeCommitMB() < 600) NotifyFallback();
                 AlarmSound.Start(cfg);
                 if (alarmStop == null)
                 {
@@ -1697,6 +1710,20 @@ namespace AnasTick
                     alarmStop.Start();
                 }
             }
+        }
+
+        // لو الذاكرة خلصت والنافذة ما قدرت تنرسم: إشعار ويندوز العادي (ما بيحتاج رسم WPF)
+        DateTime lastFallback = DateTime.MinValue;
+        public void NotifyFallback()
+        {
+            if (st.Pending.Count == 0 || (DateTime.Now - lastFallback).TotalSeconds < 60) return;
+            lastFallback = DateTime.Now;
+            try
+            {
+                string txt = string.Join("\n", st.Pending.Take(3).Select(p => p.Title));
+                tray.ShowBalloonTip(20000, "تنبيه", txt, Forms.ToolTipIcon.Warning);
+            }
+            catch (Exception ex) { Util.Log("fallback: " + ex.Message); }
         }
 
         void CloseAlarm()
@@ -1791,6 +1818,21 @@ namespace AnasTick
             Render();
         }
 
+        // الكيبورد العربي بيكتب أرقام ٠١٢٣ وفواصل عربية: بنحوّلها لأرقام عادية
+        static string NormalizeDigits(string text)
+        {
+            var sb = new StringBuilder(text.Length);
+            foreach (char c in text)
+            {
+                if (c >= '\u0660' && c <= '\u0669') sb.Append((char)('0' + (c - '\u0660')));
+                else if (c >= '\u06F0' && c <= '\u06F9') sb.Append((char)('0' + (c - '\u06F0')));
+                else if (c == '\u066B' || c == '\u060C' || c == '\u066C') sb.Append('.');
+                else if (c == '\u200F' || c == '\u200E' || c == '\u202B' || c == '\u202C') continue;   // علامات الاتجاه
+                else sb.Append(c);
+            }
+            return sb.ToString();
+        }
+
         static DateTime CeilMinute(DateTime t)
         {
             return new DateTime(t.Year, t.Month, t.Day, t.Hour, t.Minute, 0).AddMinutes(1);
@@ -1827,7 +1869,7 @@ namespace AnasTick
         static DateTime? ParseWhen(string tok, out bool timed)
         {
             timed = false;
-            tok = tok.Trim();
+            tok = NormalizeDigits(tok).Trim();
             var two = tok.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
             if (two.Length == 2)
             {
@@ -2316,6 +2358,19 @@ namespace AnasTick
         // --panel=quick|settings|list من سطر الأوامر (للاختبار والاختصارات)
         public void OpenPanel(string name)
         {
+            if (name.StartsWith("due|"))
+            {
+                var dp = name.Substring(4).Split(new[] { '|' }, 2);
+                var dt = dp.Length == 2 ? FindTask(dp[0]) : null;
+                if (dt == null) { Util.Log("due-cli: task not found"); return; }
+                string dv = dp[1].Trim();
+                if (dv.Length == 0 || dv == "-") { CommitDue(dt, null, false, true); return; }
+                bool dtimed;
+                var dat = ParseWhen(dv, out dtimed);
+                Util.Log("due-cli: '" + dv + "' -> " + (dat == null ? "null" : dat.Value.ToString("s") + " timed=" + dtimed));
+                if (dat != null) CommitDue(dt, dat, dtimed, false);
+                return;
+            }
             if (name.StartsWith("ring|")) { TestAlarm(name.Substring(5)); return; }
             if (name.StartsWith("alarm|")) { QuickFromText(name.Substring(6)); return; }
             if (name.StartsWith("rename|"))
@@ -2701,6 +2756,7 @@ namespace AnasTick
             string panelArg = args.FirstOrDefault(a => a.StartsWith("--panel="));
             string alarmArg = args.FirstOrDefault(a => a.StartsWith("--alarm="));
             string ringArg = args.FirstOrDefault(a => a.StartsWith("--ring="));
+            string dueArg = args.FirstOrDefault(a => a.StartsWith("--due="));
             string renameArg = args.FirstOrDefault(a => a.StartsWith("--rename="));
 
             bool created;
@@ -2715,7 +2771,8 @@ namespace AnasTick
             }
             if (!created)
             {
-                if (ringArg != null) { try { File.WriteAllText(Util.P("panel.req"), "ring|" + ringArg.Substring(7), new UTF8Encoding(false)); } catch { } panelEvt.Set(); }
+                if (dueArg != null) { try { File.WriteAllText(Util.P("panel.req"), "due|" + dueArg.Substring(6), new UTF8Encoding(false)); } catch { } panelEvt.Set(); }
+                else if (ringArg != null) { try { File.WriteAllText(Util.P("panel.req"), "ring|" + ringArg.Substring(7), new UTF8Encoding(false)); } catch { } panelEvt.Set(); }
                 else if (renameArg != null) { try { File.WriteAllText(Util.P("panel.req"), "rename|" + renameArg.Substring(9), new UTF8Encoding(false)); } catch { } panelEvt.Set(); }
                 else if (alarmArg != null) { try { File.WriteAllText(Util.P("panel.req"), "alarm|" + alarmArg.Substring(8), new UTF8Encoding(false)); } catch { } panelEvt.Set(); }
                 else if (panelArg != null) { try { File.WriteAllText(Util.P("panel.req"), panelArg.Substring(8)); } catch { } panelEvt.Set(); }
@@ -2731,10 +2788,21 @@ namespace AnasTick
             ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12;
 
             var app = new Application { ShutdownMode = ShutdownMode.OnExplicitShutdown };
-            app.DispatcherUnhandledException += (s, e) => { Util.Log(e.Exception.ToString()); e.Handled = true; };
+            Widget w = null;
+            DateTime lastOom = DateTime.MinValue;
+            app.DispatcherUnhandledException += (s, e) =>
+            {
+                e.Handled = true;
+                if (e.Exception is OutOfMemoryException)
+                {
+                    if ((DateTime.Now - lastOom).TotalSeconds > 60) { lastOom = DateTime.Now; Util.Log("out of memory (system), free commit " + Native.FreeCommitMB() + " MB"); }
+                    if (w != null) w.NotifyFallback();
+                    return;
+                }
+                Util.Log(e.Exception.ToString());
+            };
             AppDomain.CurrentDomain.UnhandledException += (s, e) => Util.Log("fatal: " + e.ExceptionObject);
 
-            Widget w = null;
             app.Startup += delegate
             {
                 try { w = new Widget(state, Settings.Load()); }
