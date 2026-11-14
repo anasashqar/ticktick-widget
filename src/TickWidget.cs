@@ -190,6 +190,7 @@ namespace AnasTick
         public bool SoundOn = true;
         public string Tone = "bell";      // bell | digital | soft
         public double Volume = 0.8;       // 0..1
+        public bool AutoUpdate = true;
         public int RingSeconds = 90;      // 0 = لحد ما تتصرف
 
         public static Settings Load()
@@ -213,6 +214,7 @@ namespace AnasTick
                 if ((v = Util.S(d, "tone")) != null && (v == "bell" || v == "digital" || v == "soft")) s.Tone = v;
                 if ((v = Util.S(d, "volume")) != null && double.TryParse(v, NumberStyles.Float, Util.Inv, out x)) s.Volume = Math.Max(0, Math.Min(1, x));
                 if ((v = Util.S(d, "ringSeconds")) != null && int.TryParse(v, out n)) s.RingSeconds = Math.Max(0, n);
+                if ((v = Util.S(d, "autoUpdate")) != null) s.AutoUpdate = v == "True" || v == "true";
             }
             catch (Exception ex) { Util.Log("settings: " + ex.Message); }
             return s;
@@ -225,11 +227,98 @@ namespace AnasTick
                 var d = new Dictionary<string, object>
                 {
                     { "timeZone", TimeZone }, { "width", Width }, { "opacity", Opacity }, { "style", Style }, { "refreshMinutes", RefreshMinutes },
-                    { "maxListHeight", MaxListHeight }, { "sound", SoundOn }, { "tone", Tone }, { "volume", Volume }, { "ringSeconds", RingSeconds }
+                    { "maxListHeight", MaxListHeight }, { "sound", SoundOn }, { "tone", Tone }, { "volume", Volume }, { "ringSeconds", RingSeconds }, { "autoUpdate", AutoUpdate }
                 };
                 Util.WriteAtomic(Util.P("settings.json"), Util.Json.Serialize(d));
             }
             catch (Exception ex) { Util.Log("settings save: " + ex.Message); }
+        }
+    }
+
+    // -----------------------------------------------------------------
+    //  التحديث الذاتي من GitHub Releases (المستودع لازم يكون عام)
+    // -----------------------------------------------------------------
+    static class Updater
+    {
+        public const string Current = "0.0.0";   // build.yml بيبدّلها برقم الإصدار
+        const string Repo = "anasashqar/ticktick-widget";
+        public static readonly string ExePath = Process.GetCurrentProcess().MainModule.FileName;
+
+        public class Info { public string Tag, ExeUrl, ShaUrl; }
+
+        static byte[] Download(string url, int timeoutMs, string accept)
+        {
+            var req = (HttpWebRequest)WebRequest.Create(url);
+            req.UserAgent = "TickWidget/" + Current;
+            req.Accept = accept;
+            req.Timeout = timeoutMs;
+            req.ReadWriteTimeout = timeoutMs;
+            using (var resp = (HttpWebResponse)req.GetResponse())
+            using (var s = resp.GetResponseStream())
+            using (var ms = new MemoryStream())
+            {
+                var buf = new byte[81920];
+                int n;
+                while ((n = s.Read(buf, 0, buf.Length)) > 0)
+                {
+                    ms.Write(buf, 0, n);
+                    if (ms.Length > 50 * 1024 * 1024) throw new IOException("update too large");
+                }
+                return ms.ToArray();
+            }
+        }
+
+        // null = ما في نسخة أحدث. بيرمي استثناء لو النت واقع أو المستودع مش عام
+        public static Info FindNewer()
+        {
+            string json = Encoding.UTF8.GetString(Download("https://api.github.com/repos/" + Repo + "/releases/latest", 15000, "application/vnd.github+json"));
+            var d = Util.Json.DeserializeObject(json) as Dictionary<string, object>;
+            string tag = Util.S(d, "tag_name");
+            Version latest, cur;
+            if (tag == null || !Version.TryParse(tag.TrimStart('v', 'V'), out latest)) return null;
+            if (!Version.TryParse(Current, out cur)) cur = new Version(0, 0, 0);
+            if (latest <= cur) return null;
+            var info = new Info { Tag = tag };
+            foreach (var o in Util.Arr(d["assets"]))
+            {
+                var a = o as Dictionary<string, object>;
+                string name = Util.S(a, "name"), url = Util.S(a, "browser_download_url");
+                if (name == "TickWidget.exe") info.ExeUrl = url;
+                else if (name == "TickWidget.exe.sha256") info.ShaUrl = url;
+            }
+            return info.ExeUrl != null && info.ShaUrl != null ? info : null;
+        }
+
+        // تنزيل + تحقق (sha256 وترويسة exe) إلى TickWidget.exe.new
+        public static string Stage(Info u)
+        {
+            byte[] data = Download(u.ExeUrl, 180000, "application/octet-stream");
+            string shaText = Encoding.UTF8.GetString(Download(u.ShaUrl, 15000, "application/octet-stream"));
+            var m = Regex.Match(shaText, "[0-9a-fA-F]{64}");
+            if (!m.Success) throw new IOException("no checksum");
+            string got;
+            using (var sha = SHA256.Create()) got = BitConverter.ToString(sha.ComputeHash(data)).Replace("-", "");
+            if (!string.Equals(got, m.Value, StringComparison.OrdinalIgnoreCase)) throw new IOException("checksum mismatch");
+            if (data.Length < 100000 || data[0] != 0x4D || data[1] != 0x5A) throw new IOException("not an exe");
+            string tmp = ExePath + ".new";
+            File.WriteAllBytes(tmp, data);
+            return tmp;
+        }
+
+        // ويندوز بيسمح بإعادة تسمية exe شغّال: القديم ← .old والجديد مكانه
+        public static void Swap(string tmp)
+        {
+            string old = ExePath + ".old";
+            try { if (File.Exists(old)) File.Delete(old); } catch { }
+            File.Move(ExePath, old);
+            try { File.Move(tmp, ExePath); }
+            catch { try { File.Move(old, ExePath); } catch { } throw; }
+        }
+
+        public static void Cleanup()
+        {
+            try { File.Delete(ExePath + ".old"); } catch { }
+            try { File.Delete(ExePath + ".new"); } catch { }
         }
     }
 
@@ -988,6 +1077,8 @@ namespace AnasTick
         SolidColorBrush micaBrush;
         ImageBrush glassBrush;
         AlarmWindow alarmWin;
+        DateTime lastUpdateCheck = DateTime.MinValue;
+        bool updating;
         DispatcherTimer alarmStop;
         readonly HashSet<string> silenced = new HashSet<string>(), rung = new HashSet<string>();
         int glassVer = -1;
@@ -2634,10 +2725,12 @@ namespace AnasTick
                 if (cfg.Style != "glass") SetMica();
             }));
             AddRow("التشغيل مع الجهاز", Toggle(TaskExists(), v => SetAutostart(v)));
+            AddRow("تحديث تلقائي", Toggle(cfg.AutoUpdate, v => { cfg.AutoUpdate = v; cfg.Save(); }));
 
             var wrap = new WrapPanel { Margin = new Thickness(-6, 2, 0, 0) };
             wrap.Children.Add(Pill("تحديث", () => { SetMode(Mode.List); var _ = Refresh(true); }));
             wrap.Children.Add(Pill("فتح TickTick", () => Util.Open("https://ticktick.com/webapp")));
+            wrap.Children.Add(Pill("فحص النسخة " + Updater.Current, () => { SetMode(Mode.List); CheckUpdate(true); }));
             wrap.Children.Add(Pill("تجربة المنبه", () => { SetMode(Mode.List); TestAlarm(); }));
             wrap.Children.Add(Pill("إعادة الربط", () => { SetMode(Mode.List); api.ClearToken(); needAuth = true; Render(); Connect(); }));
             wrap.Children.Add(Pill("المكان الافتراضي", () => { st.Left = null; st.Top = null; PlaceWindow(); st.Save(); }));
@@ -2716,6 +2809,7 @@ namespace AnasTick
             double wait = cfg.RefreshMinutes * 60.0;
             if (failCount > 0) wait = Math.Min(wait, 20.0 * (1 << Math.Min(failCount - 1, 10)));
             if ((now - lastRefreshTry).TotalSeconds >= wait && !connecting) { var _ = Refresh(); }
+            if (cfg.AutoUpdate && !updating && tickCount >= 3 && (now - lastUpdateCheck).TotalHours >= 6) CheckUpdate(false);
         }
 
         void OnResume()
@@ -2747,6 +2841,47 @@ namespace AnasTick
         void OnDisplayChanged(object s, EventArgs e)
         {
             Dispatcher.BeginInvoke(new Action(() => { if (cfg.Style == "glass") Glass.Load(); EnsureOnScreen(); ApplyGlass(); }), DispatcherPriority.Background);
+        }
+
+        // ----------------------------------------------------------- التحديث الذاتي
+        async void CheckUpdate(bool manual)
+        {
+            if (updating) return;
+            updating = true;
+            lastUpdateCheck = DateTime.Now;
+            try
+            {
+                var u = await Task.Run(() => Updater.FindNewer());
+                if (u == null) { if (manual) Flash("أنت على آخر نسخة"); return; }
+                if (manual) Flash("جاري تنزيل " + u.Tag + "...");
+                string tmp = await Task.Run(() => Updater.Stage(u));
+                if (alarmWin != null)   // ما منقاطع منبه شغال
+                {
+                    lastUpdateCheck = DateTime.Now.AddHours(-5.5);
+                    if (manual) Flash("في منبه شغال، جرّب بعد شوي");
+                    return;
+                }
+                Updater.Swap(tmp);
+                Util.Log("updated to " + u.Tag);
+                RestartNow();
+            }
+            catch (Exception ex)
+            {
+                Util.Log("update: " + ex.Message);
+                lastUpdateCheck = DateTime.Now.AddHours(-5.5);   // إعادة محاولة بعد نص ساعة
+                if (manual) Flash("تعذّر التحديث");
+            }
+            finally { updating = false; }
+        }
+
+        void RestartNow()
+        {
+            try { Process.Start(new ProcessStartInfo(Updater.ExePath, "--restart") { UseShellExecute = false }); }
+            catch (Exception ex) { Util.Log("restart: " + ex.Message); return; }
+            exiting = true;
+            st.Save();
+            Cleanup();
+            Application.Current.Shutdown();
         }
 
         // ----------------------------------------------------------- الخروج
@@ -2824,6 +2959,7 @@ namespace AnasTick
 
             var state = WidgetState.Load();
             state.UserExited = false;
+            Updater.Cleanup();
             state.Save();
 
             ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12;
