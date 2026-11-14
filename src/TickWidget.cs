@@ -27,6 +27,7 @@ using System.Windows.Markup;
 using System.Windows.Media;
 using System.Windows.Media.Animation;
 using System.Windows.Media.Effects;
+using System.Windows.Media.Imaging;
 using System.Windows.Threading;
 using Forms = System.Windows.Forms;
 using Drawing = System.Drawing;
@@ -46,6 +47,22 @@ namespace AnasTick
 
         public static string P(string name) { return Path.Combine(Dir, name); }
 
+        // ملفات البيانات (إعدادات، حالة، توكن، كاش، سجل). افتراضياً بجانب الـ exe،
+        // ومع --data=<مجلد> بتروح لمجلد منفصل (للاختبار بدون لمس بياناتك الحقيقية)
+        public static string DataDir = Dir;
+        public static bool Isolated;
+        public static string D(string name) { return Path.Combine(DataDir, name); }
+        public static string RestartArgs { get { return "--restart" + (Isolated ? " \"--data=" + DataDir + "\"" : ""); } }
+
+        // لاحقة فريدة لكل مجلد بيانات (أسماء الـ mutex والأحداث)، فنسخة الاختبار ما بتتصادم مع الحقيقية
+        public static string InstanceSuffix()
+        {
+            if (!Isolated) return "";
+            uint h = 2166136261;
+            foreach (char c in DataDir.ToLowerInvariant()) { h ^= c; h *= 16777619; }
+            return "." + h.ToString("x");
+        }
+
         static readonly object logLock = new object();
         static readonly Dictionary<string, DateTime> logSeen = new Dictionary<string, DateTime>();
 
@@ -60,7 +77,7 @@ namespace AnasTick
                     if (logSeen.TryGetValue(msg, out last) && (now - last).TotalMinutes < 15) return;
                     if (logSeen.Count > 200) logSeen.Clear();
                     logSeen[msg] = now;
-                    string f = P("error.log");
+                    string f = D("error.log");
                     var fi = new FileInfo(f);
                     if (fi.Exists && fi.Length > 256 * 1024)
                     {
@@ -191,6 +208,10 @@ namespace AnasTick
         public string Tone = "bell";      // bell | digital | soft
         public double Volume = 0.8;       // 0..1
         public bool AutoUpdate = true;
+        public string Sort = "due";                                  // due | priority | list
+        public string Hotkey = "Ctrl+Shift+U";                        // اختصار عام: يفتح الإضافة (أو يركّز المنبه)، فاضي = معطّل
+        public string AddProject = "";                               // القائمة الافتراضية للإضافة ("" = الوارد)
+        public List<string> HiddenProjects = new List<string>();      // قوائم مخفية (ما بتنجلب ولا بتنبّه)
         public int RingSeconds = 90;      // 0 = لحد ما تتصرف
 
         public static Settings Load()
@@ -198,7 +219,7 @@ namespace AnasTick
             var s = new Settings();
             try
             {
-                string f = Util.P("settings.json");
+                string f = Util.D("settings.json");
                 if (!File.Exists(f)) return s;
                 var d = Util.Json.DeserializeObject(File.ReadAllText(f, Encoding.UTF8)) as Dictionary<string, object>;
                 if (d == null) return s;
@@ -215,6 +236,12 @@ namespace AnasTick
                 if ((v = Util.S(d, "volume")) != null && double.TryParse(v, NumberStyles.Float, Util.Inv, out x)) s.Volume = Math.Max(0, Math.Min(1, x));
                 if ((v = Util.S(d, "ringSeconds")) != null && int.TryParse(v, out n)) s.RingSeconds = Math.Max(0, n);
                 if ((v = Util.S(d, "autoUpdate")) != null) s.AutoUpdate = v == "True" || v == "true";
+                if ((v = Util.S(d, "sort")) != null && (v == "due" || v == "priority" || v == "list")) s.Sort = v;
+                if ((v = Util.S(d, "hotkey")) != null) s.Hotkey = v.Trim();
+                if ((v = Util.S(d, "addProject")) != null) s.AddProject = v;
+                object hp;
+                if (d.TryGetValue("hiddenProjects", out hp))
+                    foreach (var hv in Util.Arr(hp)) if (hv != null && hv.ToString().Length > 0) s.HiddenProjects.Add(hv.ToString());
             }
             catch (Exception ex) { Util.Log("settings: " + ex.Message); }
             return s;
@@ -227,9 +254,9 @@ namespace AnasTick
                 var d = new Dictionary<string, object>
                 {
                     { "timeZone", TimeZone }, { "width", Width }, { "opacity", Opacity }, { "style", Style }, { "refreshMinutes", RefreshMinutes },
-                    { "maxListHeight", MaxListHeight }, { "sound", SoundOn }, { "tone", Tone }, { "volume", Volume }, { "ringSeconds", RingSeconds }, { "autoUpdate", AutoUpdate }
+                    { "maxListHeight", MaxListHeight }, { "sound", SoundOn }, { "tone", Tone }, { "volume", Volume }, { "ringSeconds", RingSeconds }, { "autoUpdate", AutoUpdate }, { "sort", Sort }, { "hiddenProjects", HiddenProjects }, { "hotkey", Hotkey }, { "addProject", AddProject }
                 };
-                Util.WriteAtomic(Util.P("settings.json"), Util.Json.Serialize(d));
+                Util.WriteAtomic(Util.D("settings.json"), Util.Json.Serialize(d));
             }
             catch (Exception ex) { Util.Log("settings save: " + ex.Message); }
         }
@@ -345,6 +372,7 @@ namespace AnasTick
         public double? Left { get; set; }
         public double? Top { get; set; }
         public bool Collapsed { get; set; }
+        public bool Locked { get; set; }       // قفل المكان والحجم
         public bool UserExited { get; set; }
         public bool Initialized { get; set; }
         public string DoneDay { get; set; }
@@ -358,7 +386,7 @@ namespace AnasTick
             WidgetState s = null;
             try
             {
-                string f = Util.P("state.json");
+                string f = Util.D("state.json");
                 if (File.Exists(f)) s = Util.Json.Deserialize<WidgetState>(File.ReadAllText(f, Encoding.UTF8));
             }
             catch (Exception ex) { Util.Log("state read: " + ex.Message); }
@@ -379,7 +407,7 @@ namespace AnasTick
                 DateTime? t = i >= 0 ? Util.FromStamp(k.Substring(i + 1)) : null;
                 return t == null || t.Value < cut;
             });
-            try { Util.WriteAtomic(Util.P("state.json"), Util.Json.Serialize(this)); }
+            try { Util.WriteAtomic(Util.D("state.json"), Util.Json.Serialize(this)); }
             catch (Exception ex) { Util.Log("state save: " + ex.Message); }
         }
     }
@@ -448,6 +476,8 @@ namespace AnasTick
     // -----------------------------------------------------------------
     //  TickTick Open API
     // -----------------------------------------------------------------
+    class ProjInfo { public string Id, Name, Color; }
+
     class AuthException : Exception { }
     class NetException : Exception { public NetException(string m) : base(m) { } }   // ما في رد من السيرفر (DNS/اتصال/مهلة)
 
@@ -465,7 +495,7 @@ namespace AnasTick
         {
             try
             {
-                string f = Util.P("token.dat");
+                string f = Util.D("token.dat");
                 if (File.Exists(f))
                     token = Encoding.UTF8.GetString(ProtectedData.Unprotect(File.ReadAllBytes(f), null, DataProtectionScope.CurrentUser));
             }
@@ -475,13 +505,13 @@ namespace AnasTick
         void SaveToken(string t)
         {
             token = t;
-            File.WriteAllBytes(Util.P("token.dat"), ProtectedData.Protect(Encoding.UTF8.GetBytes(t), null, DataProtectionScope.CurrentUser));
+            File.WriteAllBytes(Util.D("token.dat"), ProtectedData.Protect(Encoding.UTF8.GetBytes(t), null, DataProtectionScope.CurrentUser));
         }
 
         public void ClearToken()
         {
             token = null;
-            try { File.Delete(Util.P("token.dat")); } catch { }
+            try { File.Delete(Util.D("token.dat")); } catch { }
         }
 
         static async Task<string> Http(string method, string url, string auth, string contentType, string body)
@@ -492,10 +522,15 @@ namespace AnasTick
             req.Accept = "application/json";
             if (auth != null) req.Headers[HttpRequestHeader.Authorization] = auth;
             Task<string> work = Run(req, contentType, body);
-            if (await Task.WhenAny(work, Task.Delay(25000)) != work)
+            using (var cts = new CancellationTokenSource())
             {
-                req.Abort();
-                throw new TimeoutException("timeout " + url);
+                // المؤقّت بينلغى لما الطلب يخلص (قبل كان كل طلب يخلّي Task.Delay شغّال 25 ثانية)
+                if (await Task.WhenAny(work, Task.Delay(25000, cts.Token)) != work)
+                {
+                    req.Abort();
+                    throw new TimeoutException("timeout " + url);
+                }
+                cts.Cancel();
             }
             return await work;
         }
@@ -533,16 +568,24 @@ namespace AnasTick
             return Http(method, Base + path, "Bearer " + token, "application/json", body == null ? null : Util.Json.Serialize(body));
         }
 
+        public HashSet<string> Hidden = new HashSet<string>();   // قوائم مخفية: ما بتنطلب من الشبكة أصلاً
+        public List<ProjInfo> LastProjects;                       // قوائم الحساب (للإعدادات وشارة القائمة)
+
         public async Task<List<TodoTask>> FetchAll()
         {
-            var ids = new List<string> { "inbox" };
+            var ids = new List<string>();
+            if (!Hidden.Contains("inbox")) ids.Add("inbox");
+            var projs = new List<ProjInfo>();
             foreach (var o in Util.Arr(Util.Json.DeserializeObject(await Call("GET", "/project", null))))
             {
                 var d = o as Dictionary<string, object>;
                 if (d == null || Util.S(d, "closed") == "True") continue;
                 string id = Util.S(d, "id");
-                if (!string.IsNullOrEmpty(id)) ids.Add(id);
+                if (string.IsNullOrEmpty(id)) continue;
+                projs.Add(new ProjInfo { Id = id, Name = Util.S(d, "name") ?? "", Color = Util.S(d, "color") });
+                if (!Hidden.Contains(id)) ids.Add(id);
             }
+            LastProjects = projs;
 
             var jobs = ids.Select(id => Call("GET", "/project/" + Uri.EscapeDataString(id) + "/data", null)).ToList();
             var all = new List<TodoTask>();
@@ -571,7 +614,7 @@ namespace AnasTick
                     if (t.Id != null && seen.Add(t.Id)) all.Add(t);
                 }
             }
-            if (failed == jobs.Count) throw new Exception("all project requests failed");
+            if (jobs.Count > 0 && failed == jobs.Count) throw new Exception("all project requests failed");
             return all;
         }
 
@@ -630,6 +673,25 @@ namespace AnasTick
             return progman;
         }
         [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);
+        [StructLayout(LayoutKind.Sequential)] public struct PT { public int X, Y; }
+        [StructLayout(LayoutKind.Sequential)] public struct RC { public int Left, Top, Right, Bottom; }
+        [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RC r);
+        [DllImport("user32.dll")] public static extern bool RegisterHotKey(IntPtr h, int id, uint mods, uint vk);
+        [DllImport("user32.dll")] public static extern bool UnregisterHotKey(IntPtr h, int id);
+        [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+        [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+        [DllImport("user32.dll")] public static extern IntPtr SetFocus(IntPtr h);
+        [DllImport("user32.dll")] public static extern IntPtr GetFocus();
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassName(IntPtr h, StringBuilder sb, int max);
+
+        public static string ClassOf(IntPtr h)
+        {
+            var sb = new StringBuilder(64);
+            return h != IntPtr.Zero && GetClassName(h, sb, sb.Capacity) > 0 ? sb.ToString() : "";
+        }
+        public const int WM_HOTKEY = 0x0312;
+        [DllImport("user32.dll")] public static extern bool GetCursorPos(out PT p);
+        [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr h, ref PT p);
         [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
         [DllImport("user32.dll", EntryPoint = "GetWindowLong")] static extern int GetWindowLong32(IntPtr h, int i);
         [DllImport("user32.dll", EntryPoint = "SetWindowLong")] static extern int SetWindowLong32(IntPtr h, int i, int v);
@@ -651,13 +713,15 @@ namespace AnasTick
         public static IntPtr GetLong(IntPtr h, int i) { return IntPtr.Size == 8 ? GetWindowLongPtr64(h, i) : new IntPtr(GetWindowLong32(h, i)); }
         public static void SetLong(IntPtr h, int i, IntPtr v) { if (IntPtr.Size == 8) SetWindowLongPtr64(h, i, v); else SetWindowLong32(h, i, v.ToInt32()); }
 
-        // تقليل الذاكرة المحجوزة بعد كل تحديث
+        // تقليل الذاكرة المحجوزة. مرة كل 10 دقايق بالكتير: التفريغ المتكرر بيجبر الويندوز يرجّع الصفحات مرة ثانية فبيزيد الشغل مش بينقصه
+        static DateTime lastTrim = DateTime.MinValue;
         public static void Trim()
         {
+            if ((DateTime.Now - lastTrim).TotalMinutes < 10) return;
+            lastTrim = DateTime.Now;
             try
             {
                 GC.Collect();
-                GC.WaitForPendingFinalizers();
                 EmptyWorkingSet(Process.GetCurrentProcess().Handle);
             }
             catch { }
@@ -826,11 +890,28 @@ namespace AnasTick
             };
         }
 
+        public Rect Area = Rect.Empty;   // منطقة عمل شاشة الويدجت (DIP). فاضي = الشاشة الرئيسية
+
         void Place()
         {
-            var wa = SystemParameters.WorkArea;
+            var wa = Area.IsEmpty ? SystemParameters.WorkArea : Area;
             Left = wa.Left + (wa.Width - ActualWidth) / 2;
             Top = wa.Top + 4;
+        }
+
+        // كيبورد (لما النافذة تكون مركّزة: بالاختصار العام أو بضغطة): Enter خلصت، Esc إسكات، 1/2/3 تأجيل
+        protected override void OnPreviewKeyDown(KeyEventArgs e)
+        {
+            base.OnPreviewKeyDown(e);
+            if (current == null || e.Handled) return;
+            switch (e.Key)
+            {
+                case Key.Enter: if (OnDone != null) OnDone(current); e.Handled = true; break;
+                case Key.Escape: if (OnDismiss != null) OnDismiss(); e.Handled = true; break;
+                case Key.D1: case Key.NumPad1: if (OnSnooze != null) OnSnooze(current, DateTime.Now.AddMinutes(10)); e.Handled = true; break;
+                case Key.D2: case Key.NumPad2: if (OnSnooze != null) OnSnooze(current, DateTime.Now.AddHours(1)); e.Handled = true; break;
+                case Key.D3: case Key.NumPad3: if (OnSnooze != null) OnSnooze(current, DateTime.Today.AddDays(1).AddHours(9)); e.Handled = true; break;
+            }
         }
 
         static TextBlock Txt(double size, string color, bool bold)
@@ -897,7 +978,7 @@ namespace AnasTick
             Grid.SetColumn(texts, 1);
             head.Children.Add(texts);
 
-            var close = new Border { Width = 28, Height = 28, CornerRadius = new CornerRadius(14), Background = Brushes.Transparent, Cursor = Cursors.Hand, VerticalAlignment = VerticalAlignment.Top, ToolTip = "إسكات" };
+            var close = new Border { Width = 28, Height = 28, CornerRadius = new CornerRadius(14), Background = Brushes.Transparent, Cursor = Cursors.Hand, VerticalAlignment = VerticalAlignment.Top, ToolTip = "إسكات (Esc)" };
             close.Child = new TextBlock { Text = "\uE711", FontFamily = Mdl2, FontSize = 11, Foreground = Util.B("#B3FFFFFF"), HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center };
             close.MouseEnter += delegate { close.Background = Util.B("#2EFFFFFF"); };
             close.MouseLeave += delegate { close.Background = Brushes.Transparent; };
@@ -918,6 +999,7 @@ namespace AnasTick
             var b2 = Btn("ساعة", "#2EFFFFFF", "#47FFFFFF", "#FFFFFF", false, delegate { if (OnSnooze != null && current != null) OnSnooze(current, DateTime.Now.AddHours(1)); });
             var b3 = Btn("غداً 9 ص", "#2EFFFFFF", "#47FFFFFF", "#FFFFFF", false, delegate { if (OnSnooze != null && current != null) OnSnooze(current, DateTime.Today.AddDays(1).AddHours(9)); });
             Grid.SetColumn(b1, 1); Grid.SetColumn(b2, 2); Grid.SetColumn(b3, 3);
+            b0.ToolTip = "Enter"; b1.ToolTip = "1"; b2.ToolTip = "2"; b3.ToolTip = "3";
             row.Children.Add(b0); row.Children.Add(b1); row.Children.Add(b2); row.Children.Add(b3);
             stack.Children.Add(row);
 
@@ -1079,6 +1161,17 @@ namespace AnasTick
         AlarmWindow alarmWin;
         DateTime lastUpdateCheck = DateTime.MinValue;
         bool updating;
+        Grid headerGrid, gripLayer;
+        ScrollViewer panelScroll;
+        Border gripL, gripR, gripB;
+        Forms.ToolStripMenuItem lockItem;
+        bool dragging, gHoriz, gPhysLeft;
+        Native.PT gStart;
+        double gW, gL, gT, gH;
+        bool placedOnce;
+        List<ProjInfo> projects = new List<ProjInfo>();
+        bool showChips;
+        class RowItem { public TodoTask T; public DueInfo I; }
         DispatcherTimer alarmStop;
         readonly HashSet<string> silenced = new HashSet<string>(), rung = new HashSet<string>();
         int glassVer = -1;
@@ -1141,7 +1234,9 @@ namespace AnasTick
                 e.Handled = true;
             };
 
+            LoadProjects();
             tasks = LoadCache();
+            ApplyHidden();
             if (!api.HasToken) needAuth = true;
             ApplyCollapse();
             Render();
@@ -1193,8 +1288,8 @@ namespace AnasTick
                 BorderBrush = Util.B("#33FFFFFF"),
                 BorderThickness = new Thickness(1),
                 Padding = new Thickness(16, 14, 16, 14),
-                Margin = new Thickness(14),
-                Effect = new DropShadowEffect { BlurRadius = 20, ShadowDepth = 5, Opacity = 0.3, Color = Colors.Black }
+                Margin = new Thickness(14)
+                // الظل بيتحط من ApplyStyle بس بنمط الزجاج: بدونه بالنمط العادي ما بيتحمّل D3D بالإقلاع
             };
             rootBorder = root;
             var dock = new DockPanel();
@@ -1210,6 +1305,7 @@ namespace AnasTick
 
             // الرأس
             var header = new Grid { Background = Brushes.Transparent, Cursor = Cursors.SizeAll };
+            headerGrid = header;
             header.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
             header.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
             var titleStack = new StackPanel { VerticalAlignment = VerticalAlignment.Center };
@@ -1234,8 +1330,11 @@ namespace AnasTick
             header.MouseLeftButtonDown += delegate(object s, MouseButtonEventArgs e)
             {
                 if (e.ClickCount == 2) { ToggleCollapse(); return; }
+                if (st.Locked) return;
+                dragging = true;
                 try { DragMove(); } catch { }
-                st.Left = Left; st.Top = Top; st.Save();
+                dragging = false;
+                SavePos();
             };
             DockPanel.SetDock(header, Dock.Top);
             dock.Children.Add(header);
@@ -1273,8 +1372,16 @@ namespace AnasTick
             };
             body.Children.Add(listScroll);
             addGrid = new Grid { Margin = new Thickness(0, 4, 0, 0) };
-            newBox = new TextBox { Style = (Style)Resources["Input"], ToolTip = "للموعد: @بكرا   @+3   @2026-10-08\nللتنبيه: @17:30   @10د   @ساعة" };
-            newHint = T("＋  إضافة مهمة", 12, "#99FFFFFF");
+            addGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            addGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            addPick = Pill("", CycleAddProject);
+            addPick.Margin = new Thickness(0, 0, 6, 0);
+            addPick.Visibility = Visibility.Collapsed;
+            addPick.ToolTip = "القائمة للمهمة الجديدة (اضغط للتبديل)";
+            addGrid.Children.Add(addPick);
+            newBox = new TextBox { Style = (Style)Resources["Input"], ToolTip = "للموعد: @بكرا   @+3   @2026-10-08\nللتنبيه: @17:30   @10د   @ساعة\nلقائمة: #اسم_القائمة (أو زر القائمة جنبه)" };
+            newHint = T("＋  إضافة مهمة  ·  @بكرا  ·  #قائمة", 12, "#99FFFFFF");
+            newHint.TextTrimming = TextTrimming.CharacterEllipsis;
             newHint.IsHitTestVisible = false;
             newHint.VerticalAlignment = VerticalAlignment.Center;
             newHint.Margin = new Thickness(9, 0, 9, 0);
@@ -1285,17 +1392,33 @@ namespace AnasTick
                 if (e.Key == Key.Enter) { AddFromBox(); e.Handled = true; }
                 else if (e.Key == Key.Escape) { newBox.Text = ""; Keyboard.ClearFocus(); }
             };
+            Grid.SetColumn(newBox, 1);
+            Grid.SetColumn(newHint, 1);
             addGrid.Children.Add(newBox);
             addGrid.Children.Add(newHint);
             hairline = new Border { Height = 1, Background = Util.B("#1FFFFFFF"), Margin = new Thickness(2, 8, 2, 0) };
             body.Children.Add(hairline);
             body.Children.Add(addGrid);
-            panelHost = new StackPanel { Visibility = Visibility.Collapsed };
-            body.Children.Add(panelHost);
+            // لوحات الإعدادات والتنبيه السريع جوّا ScrollViewer: الإعدادات صارت أطول من الشاشة (720 DIP على شاشتك)
+            panelHost = new StackPanel();
+            panelScroll = new ScrollViewer
+            {
+                Visibility = Visibility.Collapsed,
+                MaxHeight = cfg.MaxListHeight + 80,
+                VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+                HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
+                Content = panelHost
+            };
+            body.Children.Add(panelScroll);
             dock.Children.Add(body);
 
-            Content = root;
+            var outer = new Grid();
+            outer.Children.Add(root);
+            BuildGrips();
+            outer.Children.Add(gripLayer);
+            Content = outer;
             ApplyStyle();
+            UpdateGrips();
         }
 
         Forms.ToolStripMenuItem MenuItem(string text, Action onClick)
@@ -1308,6 +1431,11 @@ namespace AnasTick
         void BuildTray()
         {
             menu = new Forms.ContextMenuStrip { RightToLeft = Forms.RightToLeft.Yes, ShowImageMargin = false, Font = new Drawing.Font("thmanyah sans", 10f) };
+            menu.Items.Add(MenuItem("الإعدادات", () => OpenPanel("settings")));
+            menu.Items.Add(MenuItem("تحديث", () => { var _ = Refresh(true); }));
+            lockItem = new Forms.ToolStripMenuItem("قفل المكان والحجم") { CheckOnClick = true, Checked = st.Locked };
+            lockItem.Click += delegate { SetLocked(lockItem.Checked); };
+            menu.Items.Add(lockItem);
             menu.Items.Add(MenuItem("خروج", ExitApp));
 
             tray = new Forms.NotifyIcon { Icon = MakeIcon(), Text = "مهامي", Visible = true, ContextMenuStrip = menu };
@@ -1444,8 +1572,8 @@ namespace AnasTick
             string hoverFill = hero ? "#30FFFFFF" : "#26FFFFFF";
             FrameworkElement linkBtn = null;
 
-            var baseColor = (Color)ColorConverter.ConvertFromString(baseFill);
-            var hoverColor = (Color)ColorConverter.ConvertFromString(hoverFill);
+            var baseColor = Util.B(baseFill).Color;
+            var hoverColor = Util.B(hoverFill).Color;
             var bg = new SolidColorBrush(baseColor);
             var border = new Border
             {
@@ -1461,12 +1589,12 @@ namespace AnasTick
             border.MouseEnter += delegate
             {
                 bg.BeginAnimation(SolidColorBrush.ColorProperty, new ColorAnimation(hoverColor, TimeSpan.FromMilliseconds(110)));
-                if (linkBtn != null) linkBtn.BeginAnimation(OpacityProperty, new DoubleAnimation(1, TimeSpan.FromMilliseconds(110)));
+                if (linkBtn != null) { linkBtn.IsHitTestVisible = true; linkBtn.BeginAnimation(OpacityProperty, new DoubleAnimation(1, TimeSpan.FromMilliseconds(110))); }
             };
             border.MouseLeave += delegate
             {
                 bg.BeginAnimation(SolidColorBrush.ColorProperty, new ColorAnimation(baseColor, TimeSpan.FromMilliseconds(180)));
-                if (linkBtn != null) linkBtn.BeginAnimation(OpacityProperty, new DoubleAnimation(0, TimeSpan.FromMilliseconds(180)));
+                if (linkBtn != null) { linkBtn.IsHitTestVisible = false; linkBtn.BeginAnimation(OpacityProperty, new DoubleAnimation(0, TimeSpan.FromMilliseconds(180))); }
             };
             var grid = new Grid();
             grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
@@ -1520,17 +1648,19 @@ namespace AnasTick
             {
                 string due = info.Text;
                 if (!string.IsNullOrEmpty(t.RepeatFlag)) due += (due.Length > 0 ? " · " : "") + "يتكرر";
-                bool hasNote = !string.IsNullOrEmpty(t.Note) && t.Note != t.Title;
+                string pn = ProjectLabel(t);
+                string noteTxt = pn.Length == 0 ? t.Note : (string.IsNullOrEmpty(t.Note) || t.Note == t.Title ? pn : pn + " · " + t.Note);
+                bool hasNote = !string.IsNullOrEmpty(noteTxt) && noteTxt != t.Title;
                 bool isExp = expanded.Contains(t.Id) && !string.IsNullOrWhiteSpace(t.Content);
                 if (due.Length > 0 || (hasNote && !isExp))
                 {
-                    var line = DueLine(due, t.Note, hot, LvlColor[info.Level], hero ? 12 : 11, !hero && !isExp);
+                    var line = DueLine(due, noteTxt, hot, LvlColor[info.Level], hero ? 12 : 11, !hero && !isExp);
                     ((FrameworkElement)line).Margin = new Thickness(0, hero ? 6 : 3, 0, 0);
                     sp.Children.Add(line);
                 }
                 if (hero && hasNote && !isExp)
                 {
-                    var note = T(t.Note, 12, "#B3FFFFFF");
+                    var note = T(noteTxt, 12, "#B3FFFFFF");
                     note.TextWrapping = TextWrapping.NoWrap;
                     note.TextTrimming = TextTrimming.CharacterEllipsis;
                     note.Margin = new Thickness(0, 4, 0, 0);
@@ -1592,7 +1722,7 @@ namespace AnasTick
 
             if ((t.Link != null || t.Image != null || !t.Temp || !string.IsNullOrWhiteSpace(t.Content)) && !pend)
             {
-                var acts = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Top, Margin = new Thickness(0, -4, -4, 0), Opacity = expanded.Contains(t.Id) ? 1 : 0 };
+                var acts = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Top, Margin = new Thickness(0, -4, -4, 0), Opacity = expanded.Contains(t.Id) ? 1 : 0, IsHitTestVisible = expanded.Contains(t.Id) };
                 if (!string.IsNullOrWhiteSpace(t.Content))
                 {
                     bool open = expanded.Contains(t.Id);
@@ -1629,12 +1759,12 @@ namespace AnasTick
         string Signature()
         {
             var sb = new StringBuilder();
-            sb.Append(DateTime.Today.Ticks).Append('|').Append(tasks == null).Append(needAuth).Append(connecting).Append('|').Append(statusText).Append('|');
+            sb.Append(cfg.Sort).Append(showChips).Append(projects.Count).Append('|').Append(DateTime.Today.Ticks).Append('|').Append(tasks == null).Append(needAuth).Append(connecting).Append('|').Append(statusText).Append('|');
             if (tasks != null)
                 foreach (var t in tasks)
                 {
                     var i = GetDue(t);
-                    sb.Append(t.Id).Append('~').Append(t.Title).Append('~').Append(t.Note).Append('~').Append(t.Link).Append('~').Append(t.Priority)
+                    sb.Append(t.Id).Append('~').Append(t.Title).Append('~').Append(t.Note).Append('~').Append(t.Content == null ? 0 : t.Content.GetHashCode()).Append('~').Append(t.Link).Append('~').Append(t.Priority)
                       .Append('~').Append(i.Text).Append('~').Append((int)i.Level).Append('~').Append(t.RepeatFlag).Append('~')
                       .Append(pendingDone.ContainsKey(t.Id)).Append('~').Append(t.Temp).Append(';');
                 }
@@ -1680,12 +1810,24 @@ namespace AnasTick
                 return;
             }
 
-            var open = tasks
-                .Select(t => new { T = t, I = GetDue(t) })
-                .OrderBy(x => (int)x.I.Level)
-                .ThenBy(x => x.T.Due ?? DateTime.MaxValue)
-                .ThenByDescending(x => x.T.Priority)
-                .ToList();
+            int visibleLists = (IsHidden("inbox") ? 0 : 1) + projects.Count(p => !IsHidden(p.Id));
+            showChips = visibleLists > 1;
+            UpdateAddPicker();
+            var items = tasks.Select(t => new RowItem { T = t, I = GetDue(t) });
+            IOrderedEnumerable<RowItem> sorted;
+            switch (cfg.Sort)
+            {
+                case "priority":
+                    sorted = items.OrderByDescending(x => x.T.Priority).ThenBy(x => (int)x.I.Level).ThenBy(x => x.T.Due ?? DateTime.MaxValue);
+                    break;
+                case "list":
+                    sorted = items.OrderBy(x => ProjectOrder(x.T.ProjectId)).ThenBy(x => (int)x.I.Level).ThenBy(x => x.T.Due ?? DateTime.MaxValue).ThenByDescending(x => x.T.Priority);
+                    break;
+                default:
+                    sorted = items.OrderBy(x => (int)x.I.Level).ThenBy(x => x.T.Due ?? DateTime.MaxValue).ThenByDescending(x => x.T.Priority);
+                    break;
+            }
+            var open = sorted.ToList();
 
             if (open.Count > 0)
             {
@@ -1722,6 +1864,89 @@ namespace AnasTick
 
             string tip = "مهامي - " + count + " مهام";
             tray.Text = tip.Length > 63 ? tip.Substring(0, 63) : tip;
+        }
+
+        // ----------------------------------------------------------- القوائم (المشاريع)
+        void LoadProjects()
+        {
+            try
+            {
+                string f = Util.D("projects.json");
+                if (!File.Exists(f)) return;
+                foreach (var o in Util.Arr(Util.Json.DeserializeObject(File.ReadAllText(f, Encoding.UTF8))))
+                {
+                    var d = o as Dictionary<string, object>;
+                    if (d != null) projects.Add(new ProjInfo { Id = Util.S(d, "id"), Name = Util.S(d, "name") ?? "", Color = Util.S(d, "color") });
+                }
+            }
+            catch (Exception ex) { Util.Log("projects read: " + ex.Message); }
+        }
+
+        void SaveProjects()
+        {
+            try { Util.WriteAtomic(Util.D("projects.json"), Util.Json.Serialize(projects.Select(p => new Dictionary<string, object> { { "id", p.Id }, { "name", p.Name }, { "color", p.Color } }).ToList())); }
+            catch (Exception ex) { Util.Log("projects save: " + ex.Message); }
+        }
+
+        bool IsHidden(string pid)
+        {
+            if (string.IsNullOrEmpty(pid)) return false;
+            return cfg.HiddenProjects.Contains(pid) || (pid.StartsWith("inbox") && cfg.HiddenProjects.Contains("inbox"));
+        }
+
+        // القوائم المخفية بتنشال من العرض فوراً (وما بتنجلب بالتحديث الجاي)
+        void ApplyHidden()
+        {
+            api.Hidden = new HashSet<string>(cfg.HiddenProjects);
+            if (tasks != null) tasks = tasks.Where(t => !IsHidden(t.ProjectId)).ToList();
+        }
+
+        void ToggleProject(string id)
+        {
+            if (!cfg.HiddenProjects.Remove(id)) cfg.HiddenProjects.Add(id);
+            cfg.Save();
+            bool hiddenNow = cfg.HiddenProjects.Contains(id);
+            ApplyHidden();
+            lastSig = null;
+            Render();
+            if (hiddenNow) SaveCache(); else { var _ = Refresh(true); }   // لما بترجّع قائمة بنجيب مهامها
+        }
+
+        // اسم القائمة بالمهمة، بس لما في أكتر من قائمة ظاهرة
+        string ProjectLabel(TodoTask t)
+        {
+            if (!showChips || string.IsNullOrEmpty(t.ProjectId)) return "";
+            foreach (var p in projects) if (p.Id == t.ProjectId) return p.Name;
+            return t.ProjectId.StartsWith("inbox") ? "الوارد" : "";
+        }
+
+        int ProjectOrder(string pid)
+        {
+            if (!string.IsNullOrEmpty(pid) && pid.StartsWith("inbox")) return -1;
+            for (int i = 0; i < projects.Count; i++) if (projects[i].Id == pid) return i;
+            return int.MaxValue;
+        }
+
+        void BuildListsChooser()
+        {
+            var all = new List<ProjInfo> { new ProjInfo { Id = "inbox", Name = "الوارد" } };
+            all.AddRange(projects);
+            var wrapL = new WrapPanel { Margin = new Thickness(-6, -2, 0, 2) };
+            foreach (var p in all)
+            {
+                var proj = p;
+                Button b = null;
+                Action paint = () =>
+                {
+                    bool hid = cfg.HiddenProjects.Contains(proj.Id);
+                    b.Opacity = hid ? 0.45 : 1;
+                    if (hid) b.ClearValue(Control.ForegroundProperty); else b.Foreground = Util.B(Green);
+                };
+                b = Pill(proj.Name, () => { ToggleProject(proj.Id); paint(); });
+                paint();
+                wrapL.Children.Add(b);
+            }
+            AddBlock(wrapL);
         }
 
         void RenderStatus()
@@ -1797,7 +2022,7 @@ namespace AnasTick
 
             if (alarmWin == null)
             {
-                try { alarmWin = new AlarmWindow(); }
+                try { alarmWin = new AlarmWindow { Area = MonitorWorkAreaDip() }; }
                 catch (Exception ex) { Util.Log("alarm window: " + ex.Message); alarmWin = null; NotifyFallback(); AlarmSound.Start(cfg); return; }
                 alarmWin.OnDone = p => { var t = FindTask(p.TaskId); RemovePending(p.TaskId); st.Save(); if (t != null) ToggleComplete(t); else Render(); };
                 alarmWin.OnSnooze = (p, at) => Snooze(p.TaskId, at);
@@ -2028,10 +2253,21 @@ namespace AnasTick
         {
             string text = newBox.Text.Trim();
             if (text.Length == 0) return;
-            string title = text;
+            string work = text;
+            string pid = EffectiveAddProject();
+            var pm = Regex.Match(work, @"(?:^|\s)#(\S+)");
+            if (pm.Success)
+            {
+                string key = pm.Groups[1].Value.Replace('_', ' ');
+                string found = FindProject(key);
+                if (found == null) { Flash("ما في قائمة باسم " + key); return; }
+                pid = found;
+                work = work.Remove(pm.Index, pm.Length).Trim();
+            }
+            string title = work;
             DateTime? due = null;
             bool timed = false;
-            var m = Regex.Match(text, @"^(.*?)\s*@(\S+)$");
+            var m = Regex.Match(work, @"^(.*?)\s*@(\S+)$");
             if (m.Success)
             {
                 var d = ParseWhen(m.Groups[2].Value, out timed);
@@ -2041,15 +2277,16 @@ namespace AnasTick
             if (title.Length == 0) return;
             if (needAuth) { Connect(); return; }
             newBox.Text = "";
-            var _ = CreateTask(title, due, timed, text);
+            var _ = CreateTask(title, due, timed, text, pid);
             if (timed && due != null) Flash("تنبيه " + Util.When(due.Value));
         }
 
         // timed = تنبيه: بوقت محدد وبيرن المنبه، وبينحفظ بـ TickTick فبيوصل للجوال كمان
-        async Task CreateTask(string title, DateTime? due, bool timed, string restoreText)
+        async Task CreateTask(string title, DateTime? due, bool timed, string restoreText, string projectId = null)
         {
             if (needAuth) { Connect(); return; }
             var body = new Dictionary<string, object> { { "title", title } };
+            if (!string.IsNullOrEmpty(projectId) && projectId != "inbox") body["projectId"] = projectId;
             if (due != null)
             {
                 body["dueDate"] = Util.ToTT(due.Value);
@@ -2059,7 +2296,7 @@ namespace AnasTick
                 if (timed) body["reminders"] = new List<string> { "TRIGGER:PT0S" };
             }
             if (tasks == null) tasks = new List<TodoTask>();
-            var temp = new TodoTask { Id = "tmp-" + Guid.NewGuid().ToString("N"), Title = title, Due = due, AllDay = !timed, Content = "", Temp = true };
+            var temp = new TodoTask { Id = "tmp-" + Guid.NewGuid().ToString("N"), Title = title, Due = due, AllDay = !timed, Content = "", Temp = true, ProjectId = (projectId != null && projectId != "inbox") ? projectId : "" };
             tasks.Add(temp);
             Render();
             try
@@ -2179,6 +2416,7 @@ namespace AnasTick
             {
                 if (!api.HasToken) { needAuth = true; return; }
                 var list = await api.FetchAll();
+                if (api.LastProjects != null) { projects = api.LastProjects; SaveProjects(); }
                 // المهام يلي لسا بمهلة التراجع بنخليها ظاهرة
                 tasks = list;
                 needAuth = false;
@@ -2207,7 +2445,7 @@ namespace AnasTick
         {
             try
             {
-                string f = Util.P("cache.json");
+                string f = Util.D("cache.json");
                 if (!File.Exists(f)) return null;
                 var list = new List<TodoTask>();
                 foreach (var o in Util.Arr(Util.Json.DeserializeObject(File.ReadAllText(f, Encoding.UTF8))))
@@ -2224,9 +2462,19 @@ namespace AnasTick
         void SaveCache()
         {
             if (tasks == null) return;
-            try { Util.WriteAtomic(Util.P("cache.json"), Util.Json.Serialize(tasks.Where(t => !t.Temp).Select(t => t.Raw).ToList())); }
+            try
+            {
+                string text = Util.Json.Serialize(tasks.Where(t => !t.Temp).Select(t => t.Raw).ToList());
+                string f = Util.D("cache.json");
+                // نفس المحتوى: ما منعيد كتابة الملف، بس منحدّث وقته (بيُستعمل كـ "آخر تحديث" لما تفتح الأداة)
+                if (text == lastCacheText && File.Exists(f)) { File.SetLastWriteTime(f, DateTime.Now); return; }
+                lastCacheText = text;
+                Util.WriteAtomic(f, text);
+            }
             catch (Exception ex) { Util.Log("cache save: " + ex.Message); }
         }
+
+        string lastCacheText;
 
         // ----------------------------------------------------------- الربط (OAuth)
         class Secret { public string Id, Key; }
@@ -2235,7 +2483,7 @@ namespace AnasTick
         {
             try
             {
-                var d = Util.Json.DeserializeObject(File.ReadAllText(Util.P("ticktick.secret.json"), Encoding.UTF8)) as Dictionary<string, object>;
+                var d = Util.Json.DeserializeObject(File.ReadAllText(Util.D("ticktick.secret.json"), Encoding.UTF8)) as Dictionary<string, object>;
                 var s = new Secret { Id = Util.S(d, "client_id"), Key = Util.S(d, "client_secret") };
                 if (string.IsNullOrEmpty(s.Id) || string.IsNullOrEmpty(s.Key)) return null;
                 return s;
@@ -2371,6 +2619,7 @@ namespace AnasTick
             HwndSource.FromHwnd(hwnd).AddHook(WndProc);
             long ex = Native.GetLong(hwnd, Native.GWL_EXSTYLE).ToInt64();
             Native.SetLong(hwnd, Native.GWL_EXSTYLE, new IntPtr((ex | Native.WS_EX_TOOLWINDOW) & ~(long)Native.WS_EX_APPWINDOW));
+            if (!Util.Isolated) RegisterHotkey(cfg.Hotkey);
             AttachToDesktop();
             PlaceWindow();
             ApplyGlass();
@@ -2403,13 +2652,254 @@ namespace AnasTick
             Native.SetLong(hwnd, Native.GWL_STYLE, new IntPtr(style));
             Native.SetParent(hwnd, host);
             ApplyZ();
+            if (placedOnce) PlaceWindow();   // الإحداثيات صارت نسبة للأب الجديد
         }
 
         IntPtr desktopHost;
 
         IntPtr WndProc(IntPtr h, int msg, IntPtr w, IntPtr l, ref bool handled)
         {
+            if (msg == Native.WM_HOTKEY && w.ToInt32() == HotkeyId)
+            {
+                handled = true;
+                Dispatcher.BeginInvoke(new Action(HotkeyPressed));
+                return IntPtr.Zero;
+            }
+            // أثناء سحب الرأس: تلصّق بحواف منطقة العمل
+            if (msg == Native.WM_WINDOWPOSCHANGING && dragging && desktopHost != IntPtr.Zero)
+            {
+                try
+                {
+                    var wp = (Native.WINDOWPOS)Marshal.PtrToStructure(l, typeof(Native.WINDOWPOS));
+                    if ((wp.flags & Native.SWP_NOMOVE) == 0) { SnapMove(ref wp); Marshal.StructureToPtr(wp, l, false); }
+                }
+                catch { }
+            }
             return IntPtr.Zero;
+        }
+
+        // ----------------------------------------------------------- اختصار عام + إضافة بقائمة
+        const int HotkeyId = 0x7A11;
+        bool hotkeyOn;
+        Button addPick;
+
+        static bool ParseHotkey(string s, out uint mods, out uint vk)
+        {
+            mods = 0; vk = 0;
+            foreach (var part in (s ?? "").Split('+'))
+            {
+                string p = part.Trim().ToLowerInvariant();
+                if (p == "ctrl" || p == "control") mods |= 2;
+                else if (p == "alt") mods |= 1;
+                else if (p == "shift") mods |= 4;
+                else if (p == "win") mods |= 8;
+                else if (p.Length > 0)
+                {
+                    Key k;
+                    if (p.Length == 1 && char.IsDigit(p[0])) p = "D" + p;
+                    if (!Enum.TryParse(p, true, out k)) return false;
+                    vk = (uint)KeyInterop.VirtualKeyFromKey(k);
+                }
+            }
+            return vk != 0 && mods != 0;
+        }
+
+        bool RegisterHotkey(string spec)
+        {
+            if (hotkeyOn) { Native.UnregisterHotKey(hwnd, HotkeyId); hotkeyOn = false; }
+            if (string.IsNullOrWhiteSpace(spec)) return false;
+            uint mods, vk;
+            if (!ParseHotkey(spec, out mods, out vk)) { Util.Log("hotkey: ما فهمت '" + spec + "'"); return false; }
+            hotkeyOn = Native.RegisterHotKey(hwnd, HotkeyId, mods | 0x4000, vk);   // 0x4000 = بدون تكرار مع الضغط المستمر
+            if (!hotkeyOn) Util.Log("hotkey: '" + spec + "' مستعمل من برنامج ثاني");
+            return hotkeyOn;
+        }
+
+        // سطح المكتب ظاهر أصلاً؟ (الواجهة الأمامية هي سطح المكتب نفسه)
+        static bool DesktopForeground()
+        {
+            string c = Native.ClassOf(Native.GetForegroundWindow());
+            return c == "Progman" || c == "WorkerW" || c == "Shell_TrayWnd";
+        }
+
+        // الاختصار: لو في منبه شغّال بيركّزه (Enter خلصت، Esc إسكات، 1/2/3 تأجيل)، وغير هيك بيفتح شريط الإضافة
+        void HotkeyPressed()
+        {
+            if (Util.Isolated) Util.Log("DBG hotkey pressed (alarm=" + (alarmWin != null) + ")");
+            if (alarmWin != null) { try { alarmWin.Activate(); } catch { } return; }
+            if (newBox.IsKeyboardFocusWithin) { Keyboard.ClearFocus(); if (!Util.Isolated && !DesktopForeground()) Peek(); return; }
+            if (st.Collapsed) { st.Collapsed = false; ApplyCollapse(); st.Save(); }
+            if (mode != Mode.List) SetMode(Mode.List);
+            if (!Util.Isolated && !DesktopForeground()) Peek();   // عرض سطح المكتب عشان الويدجت يبين
+            var t = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(220) };
+            t.Tick += delegate { t.Stop(); FocusAddBox(); };
+            t.Start();
+        }
+
+        void FocusAddBox()
+        {
+            Native.SetForegroundWindow(hwnd);
+            Activate();
+            newBox.Focus();
+            Keyboard.Focus(newBox);
+            if (Util.Isolated) Util.Log("DBG FocusAddBox: wpfFocused=" + newBox.IsKeyboardFocused + " fgIsUs=" + (Native.GetForegroundWindow() == hwnd) + " fgClass=" + Native.ClassOf(Native.GetForegroundWindow()));
+        }
+
+        string EffectiveAddProject()
+        {
+            string id = string.IsNullOrEmpty(cfg.AddProject) ? "inbox" : cfg.AddProject;
+            if (id != "inbox" && (IsHidden(id) || !projects.Any(p => p.Id == id))) return "inbox";
+            return id;
+        }
+
+        string ProjectName(string id)
+        {
+            if (id == "inbox") return "الوارد";
+            foreach (var p in projects) if (p.Id == id) return p.Name;
+            return "الوارد";
+        }
+
+        void UpdateAddPicker()
+        {
+            if (addPick == null) return;
+            addPick.Visibility = showChips ? Visibility.Visible : Visibility.Collapsed;
+            addPick.Content = ProjectName(EffectiveAddProject());
+        }
+
+        void CycleAddProject()
+        {
+            var ids = new List<string>();
+            if (!IsHidden("inbox")) ids.Add("inbox");
+            foreach (var p in projects) if (!IsHidden(p.Id)) ids.Add(p.Id);
+            if (ids.Count == 0) return;
+            int i = ids.IndexOf(EffectiveAddProject());
+            cfg.AddProject = ids[(i + 1) % ids.Count];
+            cfg.Save();
+            UpdateAddPicker();
+        }
+
+        // #اسم بشريط الإضافة: تطابق تام، وإلا بيبدأ بـ، وإلا بيحتوي
+        string FindProject(string key)
+        {
+            key = key.Trim();
+            if (key.Equals("inbox", StringComparison.OrdinalIgnoreCase) || key == "الوارد") return "inbox";
+            var vis = projects.Where(p => !IsHidden(p.Id)).ToList();
+            var hit = vis.FirstOrDefault(p => p.Name.Equals(key, StringComparison.OrdinalIgnoreCase))
+                   ?? vis.FirstOrDefault(p => p.Name.StartsWith(key, StringComparison.OrdinalIgnoreCase))
+                   ?? vis.FirstOrDefault(p => p.Name.IndexOf(key, StringComparison.OrdinalIgnoreCase) >= 0);
+            return hit == null ? null : hit.Id;
+        }
+
+        // ----------------------------------------------------------- قفل، تغيير حجم، تلصّق
+        const double SnapPx = 12;
+
+        // الحواف المرئية للبطاقة (مش حواف النافذة بهوامش الظل) بتلصق بحواف منطقة العمل
+        void SnapMove(ref Native.WINDOWPOS wp)
+        {
+            var m = ToDevice();
+            double mg = rootBorder.Margin.Left * m.M11;
+            var o = new Native.PT();
+            Native.ClientToScreen(desktopHost, ref o);   // نقطة (0,0) لنافذة الأب بإحداثيات الشاشة
+            int sx = wp.x + o.X, sy = wp.y + o.Y;
+            var wa = Forms.Screen.FromPoint(new Drawing.Point(sx + wp.cx / 2, sy + 30)).WorkingArea;
+            int cl = (int)(sx + mg), cr = (int)(sx + wp.cx - mg), ct = (int)(sy + mg), cb = (int)(sy + wp.cy - mg);
+            if (Math.Abs(cl - wa.Left) < SnapPx) sx += wa.Left - cl;
+            else if (Math.Abs(cr - wa.Right) < SnapPx) sx += wa.Right - cr;
+            if (Math.Abs(ct - wa.Top) < SnapPx) sy += wa.Top - ct;
+            else if (Math.Abs(cb - wa.Bottom) < SnapPx) sy += wa.Bottom - cb;
+            wp.x = sx - o.X;
+            wp.y = sy - o.Y;
+        }
+
+        Border MakeGrip(HorizontalAlignment h, VerticalAlignment v, Cursor c, Thickness mg, double w, double hh, bool horizontal)
+        {
+            var g = new Border { Background = Brushes.Transparent, HorizontalAlignment = h, VerticalAlignment = v, Cursor = c, Margin = mg };
+            if (!double.IsNaN(w)) g.Width = w;
+            if (!double.IsNaN(hh)) g.Height = hh;
+            g.MouseLeftButtonDown += delegate(object s, MouseButtonEventArgs e) { GripDown(g, horizontal, e); };
+            g.MouseMove += delegate { GripMove(g); };
+            g.MouseLeftButtonUp += delegate { GripUp(g); };
+            g.LostMouseCapture += delegate { cfg.Save(); };
+            return g;
+        }
+
+        void BuildGrips()
+        {
+            gripLayer = new Grid { Margin = rootBorder.Margin };
+            gripL = MakeGrip(HorizontalAlignment.Left, VerticalAlignment.Stretch, Cursors.SizeWE, new Thickness(-4, 26, 0, 26), 8, double.NaN, true);
+            gripR = MakeGrip(HorizontalAlignment.Right, VerticalAlignment.Stretch, Cursors.SizeWE, new Thickness(0, 26, -4, 26), 8, double.NaN, true);
+            gripB = MakeGrip(HorizontalAlignment.Stretch, VerticalAlignment.Bottom, Cursors.SizeNS, new Thickness(26, 0, 26, -4), double.NaN, 8, false);
+            gripLayer.Children.Add(gripL);
+            gripLayer.Children.Add(gripR);
+            gripLayer.Children.Add(gripB);
+        }
+
+        void UpdateGrips()
+        {
+            bool free = !st.Locked;
+            if (gripL != null)
+            {
+                gripL.Visibility = gripR.Visibility = free ? Visibility.Visible : Visibility.Collapsed;
+                gripB.Visibility = free && !st.Collapsed ? Visibility.Visible : Visibility.Collapsed;
+            }
+            if (headerGrid != null) headerGrid.Cursor = free ? Cursors.SizeAll : Cursors.Arrow;
+        }
+
+        void SetLocked(bool v)
+        {
+            st.Locked = v;
+            st.Save();
+            UpdateGrips();
+            if (lockItem != null && lockItem.Checked != v) lockItem.Checked = v;
+        }
+
+        void GripDown(Border g, bool horizontal, MouseButtonEventArgs e)
+        {
+            if (st.Locked) return;
+            Native.GetCursorPos(out gStart);
+            var gp = ScreenPos();
+            gW = Width; gL = gp.X; gT = gp.Y; gH = listScroll.ActualHeight;
+            gHoriz = horizontal;
+            if (horizontal)
+            {
+                // أي حافة فيزيائياً (الاتجاه RTL بيقلب Left/Right)
+                double gx = g.PointToScreen(new Point(g.ActualWidth / 2, 0)).X;
+                double cx = PointToScreen(new Point(ActualWidth / 2, 0)).X;
+                gPhysLeft = gx < cx;
+            }
+            g.CaptureMouse();
+            e.Handled = true;
+        }
+
+        void GripMove(Border g)
+        {
+            if (!g.IsMouseCaptured) return;
+            Native.PT now;
+            Native.GetCursorPos(out now);
+            var m = ToDevice();
+            if (gHoriz)
+            {
+                double dx = (now.X - gStart.X) / m.M11;
+                double nw = Math.Max(260, Math.Min(600, gPhysLeft ? gW - dx : gW + dx));
+                if (gPhysLeft) MoveToScreen(gL + (gW - nw), gT);
+                Width = nw;
+            }
+            else
+            {
+                double dy = (now.Y - gStart.Y) / m.M22;
+                listScroll.MaxHeight = Math.Max(150, Math.Min(1400, gH + dy));
+                panelScroll.MaxHeight = listScroll.MaxHeight + 80;
+            }
+        }
+
+        void GripUp(Border g)
+        {
+            if (!g.IsMouseCaptured) return;
+            g.ReleaseMouseCapture();
+            cfg.Width = Width;
+            cfg.MaxListHeight = listScroll.MaxHeight;
+            cfg.Save();
+            SavePos();
         }
 
         // فوق أيقونات سطح المكتب بس (بين إخوتها جوّا سطح المكتب)
@@ -2438,15 +2928,57 @@ namespace AnasTick
             return Matrix.Identity;
         }
 
+        // النافذة ابنة لنافذة سطح المكتب (Progman/WorkerW) اللي بتغطي كل الشاشات: إحداثياتها نسبة لزاويتها (مش للشاشة).
+        // مع شاشة يسار الرئيسية (أو فوقها) بتكون الزاوية سالبة، فبنحوّل صراحةً بدل ما نعتمد على Left/Top بتاعت WPF.
+        // مع شاشة وحدة الزاوية (0,0) فالنتيجة مطابقة للقديم
+        Native.PT ParentOrigin()
+        {
+            var o = new Native.PT();
+            if (hwnd != IntPtr.Zero && desktopHost != IntPtr.Zero && Native.GetParent(hwnd) == desktopHost) Native.ClientToScreen(desktopHost, ref o);
+            return o;
+        }
+
+        // موقع النافذة بإحداثيات الشاشة (DIP)
+        Point ScreenPos()
+        {
+            var m = ToDevice();
+            Native.RC r;
+            if (hwnd == IntPtr.Zero || !Native.GetWindowRect(hwnd, out r)) return new Point(Left, Top);
+            return new Point(r.Left / m.M11, r.Top / m.M22);
+        }
+
+        void MoveToScreen(double x, double y)
+        {
+            if (hwnd == IntPtr.Zero) { Left = x; Top = y; return; }
+            var m = ToDevice();
+            var o = ParentOrigin();
+            Native.SetWindowPos(hwnd, IntPtr.Zero, (int)Math.Round(x * m.M11) - o.X, (int)Math.Round(y * m.M22) - o.Y, 0, 0, Native.SWP_NOSIZE | Native.SWP_NOZORDER | Native.SWP_NOACTIVATE);
+        }
+
+        void SavePos()
+        {
+            var p = ScreenPos();
+            st.Left = p.X; st.Top = p.Y;
+            st.Save();
+        }
+
+        // منطقة عمل الشاشة اللي عليها الويدجت (DIP): المنبه بيطلع هناك مش دايماً على الرئيسية
+        Rect MonitorWorkAreaDip()
+        {
+            var m = ToDevice();
+            var wa = (hwnd != IntPtr.Zero ? Forms.Screen.FromHandle(hwnd) : Forms.Screen.PrimaryScreen).WorkingArea;
+            return new Rect(wa.Left / m.M11, wa.Top / m.M22, wa.Width / m.M11, wa.Height / m.M22);
+        }
+
         void PlaceWindow()
         {
-            if (st.Left != null && st.Top != null) { Left = st.Left.Value; Top = st.Top.Value; }
+            placedOnce = true;
+            if (st.Left != null && st.Top != null) MoveToScreen(st.Left.Value, st.Top.Value);
             else
             {
                 var m = ToDevice();
                 var wa = Forms.Screen.PrimaryScreen.WorkingArea;
-                Left = wa.Right / m.M11 - Width - 4;
-                Top = wa.Top / m.M22 + 4;
+                MoveToScreen(wa.Right / m.M11 - Width - 4, wa.Top / m.M22 + 4);
             }
             EnsureOnScreen();
         }
@@ -2457,16 +2989,16 @@ namespace AnasTick
             if (hwnd == IntPtr.Zero) return;
             var m = ToDevice();
             double w = ActualWidth > 0 ? ActualWidth : Width;
-            var head = new Drawing.Rectangle((int)(Left * m.M11), (int)(Top * m.M22), (int)(w * m.M11), (int)(60 * m.M22));
+            var sp = ScreenPos();
+            var head = new Drawing.Rectangle((int)(sp.X * m.M11), (int)(sp.Y * m.M22), (int)(w * m.M11), (int)(60 * m.M22));
             foreach (var s in Forms.Screen.AllScreens)
             {
                 var i = Drawing.Rectangle.Intersect(s.WorkingArea, head);
                 if (i.Width >= 100 * m.M11 && i.Height >= 30 * m.M22) return;
             }
             var wa = Forms.Screen.PrimaryScreen.WorkingArea;
-            Left = wa.Right / m.M11 - w - 4;
-            Top = wa.Top / m.M22 + 4;
-            st.Left = Left; st.Top = Top; st.Save();
+            MoveToScreen(wa.Right / m.M11 - w - 4, wa.Top / m.M22 + 4);
+            SavePos();
         }
 
         // ----------------------------------------------------------- لوحات التنبيه السريع والإعدادات
@@ -2476,8 +3008,128 @@ namespace AnasTick
         }
 
         // --panel=quick|settings|list من سطر الأوامر (للاختبار والاختصارات)
+        // أوامر اختبار (وضع --data فقط): بتفحص المنطق بدون تحريك الماوس الحقيقي
+        void DebugCmd(string cmd)
+        {
+            try
+            {
+                if (cmd == "grips")
+                {
+                    Func<FrameworkElement, string> r = el =>
+                    {
+                        var p = el.PointToScreen(new Point(0, 0));
+                        return string.Format("x={0:0} y={1:0} w={2:0} h={3:0} vis={4}", p.X, p.Y, el.ActualWidth, el.ActualHeight, el.Visibility);
+                    };
+                    var wp = PointToScreen(new Point(0, 0));
+                    Util.Log("DBG window x=" + wp.X.ToString("0") + " y=" + wp.Y.ToString("0") + " w=" + ActualWidth.ToString("0") + " Width=" + Width.ToString("0") + " Locked=" + st.Locked + " maxList=" + listScroll.MaxHeight.ToString("0"));
+                    Util.Log("DBG gripL " + r(gripL) + " | gripR " + r(gripR) + " | gripB " + r(gripB));
+                }
+                else if (cmd.StartsWith("hotkey="))
+                {
+                    // يسجّل اختصاراً تجريبياً ويرجّع نتيجة التحليل والتسجيل
+                    uint mo, vk;
+                    bool parsed = ParseHotkey(cmd.Substring(7), out mo, out vk);
+                    Util.Log("DBG hotkey parse=" + parsed + " mods=" + mo + " vk=0x" + vk.ToString("x") + " registered=" + (parsed && RegisterHotkey(cmd.Substring(7))));
+                }
+                else if (cmd == "focus")
+                {
+                    FocusAddBox();
+                    Util.Log("DBG focus: wpfFocused=" + newBox.IsKeyboardFocused + " win32Focus=" + (Native.GetFocus() == hwnd) + " fgIsUs=" + (Native.GetForegroundWindow() == hwnd) + " fgClass=" + Native.ClassOf(Native.GetForegroundWindow()));
+                }
+                else if (cmd.StartsWith("add="))
+                {
+                    newBox.Text = cmd.Substring(4);   // بيجرّب تحليل #قائمة و@ بدون إرسال لـ TickTick (needAuth)
+                    var pm = Regex.Match(newBox.Text, @"(?:^|\s)#(\S+)");
+                    string found = pm.Success ? FindProject(pm.Groups[1].Value.Replace('_', ' ')) : EffectiveAddProject();
+                    Util.Log("DBG add: text='" + newBox.Text + "' -> project=" + (found ?? "NONE") + " picker='" + addPick.Content + "' pickerVisible=" + addPick.Visibility);
+                    newBox.Text = "";
+                }
+                else if (cmd == "pos")
+                {
+                    var sp = ScreenPos(); var o = ParentOrigin(); var m = ToDevice(); var ps = PointToScreen(new Point(0, 0)); var ar = MonitorWorkAreaDip();
+                    Util.Log(string.Format("DBG pos screenDip=({0:0.#},{1:0.#}) parentOriginPx=({2},{3}) dpi={4:0.##} pointToScreenPx=({5:0},{6:0}) workAreaDip={7}", sp.X, sp.Y, o.X, o.Y, m.M11, ps.X, ps.Y, ar));
+                }
+                else if (cmd.StartsWith("move="))
+                {
+                    var p = cmd.Substring(5).Split(',');
+                    MoveToScreen(double.Parse(p[0], Util.Inv), double.Parse(p[1], Util.Inv));
+                    SavePos();
+                    var sp = ScreenPos();
+                    Util.Log(string.Format("DBG move requested=({0},{1}) now=({2:0.#},{3:0.#}) saved=({4:0.#},{5:0.#})", p[0], p[1], sp.X, sp.Y, st.Left, st.Top));
+                }
+                else if (cmd == "text") { Util.Log("DBG newBox.Text='" + newBox.Text + "' focused=" + newBox.IsKeyboardFocused); newBox.Text = ""; }
+                else if (cmd == "cycle") { CycleAddProject(); Util.Log("DBG cycle -> " + EffectiveAddProject() + " '" + addPick.Content + "'"); }
+                else if (cmd.StartsWith("sort="))
+                {
+                    cfg.Sort = cmd.Substring(5); cfg.Save(); lastSig = null; Render();
+                    Util.Log("DBG sort=" + cfg.Sort);
+                }
+                else if (cmd.StartsWith("toggle="))
+                {
+                    ToggleProject(cmd.Substring(7));
+                    Util.Log("DBG hidden=[" + string.Join(",", cfg.HiddenProjects) + "] tasks=" + (tasks == null ? -1 : tasks.Count) + " chips=" + showChips);
+                }
+                else if (cmd == "order")
+                {
+                    Util.Log("DBG order: " + string.Join(" | ", listPanel.Children.OfType<Border>().Select(b => ((TextBlock)((StackPanel)((Grid)b.Child).Children.OfType<StackPanel>().First()).Children[0]).Text)));
+                }
+                else if (cmd.StartsWith("lock="))
+                {
+                    SetLocked(cmd.Substring(5) == "1");
+                    Util.Log("DBG locked=" + st.Locked);
+                }
+                else if (cmd.StartsWith("size="))
+                {
+                    var p = cmd.Substring(5).Split(',');   // عرض,ارتفاع القائمة (يحاكي نتيجة السحب)
+                    Width = Math.Max(260, Math.Min(600, double.Parse(p[0], Util.Inv)));
+                    listScroll.MaxHeight = Math.Max(150, Math.Min(1400, double.Parse(p[1], Util.Inv)));
+                    panelScroll.MaxHeight = listScroll.MaxHeight + 80;
+                    cfg.Width = Width; cfg.MaxListHeight = listScroll.MaxHeight; cfg.Save();
+                    Util.Log("DBG size w=" + Width + " maxList=" + listScroll.MaxHeight);
+                }
+                else if (cmd.StartsWith("snap="))
+                {
+                    var p = cmd.Substring(5).Split(',');   // x,y (إحداثيات الأب) => نتيجة التلصّق
+                    var wp = new Native.WINDOWPOS { x = int.Parse(p[0]), y = int.Parse(p[1]), cx = (int)(ActualWidth * ToDevice().M11), cy = (int)(ActualHeight * ToDevice().M22) };
+                    var o = new Native.PT();
+                    Native.ClientToScreen(desktopHost, ref o);
+                    var wa = Forms.Screen.FromPoint(new Drawing.Point(wp.x + o.X + wp.cx / 2, wp.y + o.Y + 30)).WorkingArea;
+                    SnapMove(ref wp);
+                    Util.Log("DBG snap in=" + p[0] + "," + p[1] + " out=" + wp.x + "," + wp.y + " parentOrigin=" + o.X + "," + o.Y + " workArea=" + wa);
+                }
+            }
+            catch (Exception ex) { Util.Log("DBG error " + ex.Message); }
+        }
+
+        // وضع اختبار فقط (--data): رسم الويدجت نفسه لملف PNG بدون التقاط الشاشة
+        void SaveShot(string path)
+        {
+            if (!Util.Isolated) return;
+            try
+            {
+                var el = (FrameworkElement)Content;
+                el.UpdateLayout();
+                int w = Math.Max(1, (int)Math.Ceiling(ActualWidth)), h = Math.Max(1, (int)Math.Ceiling(ActualHeight));
+                var rtb = new RenderTargetBitmap(w, h, 96, 96, PixelFormats.Pbgra32);
+                // VisualBrush بدل الرسم المباشر: غير هيك النص (RTL) بيطلع معكوس بالـ PNG
+                var dv = new DrawingVisual();
+                using (var dc = dv.RenderOpen())
+                {
+                    if (FlowDirection == FlowDirection.RightToLeft) dc.PushTransform(new MatrixTransform(-1, 0, 0, 1, w, 0));   // الرسم خارج النافذة بيطلع معكوس أفقياً
+                    dc.DrawRectangle(new VisualBrush(el), null, new Rect(0, 0, w, h));
+                }
+                rtb.Render(dv);
+                var enc = new PngBitmapEncoder();
+                enc.Frames.Add(BitmapFrame.Create(rtb));
+                using (var fs = File.Create(path)) enc.Save(fs);
+            }
+            catch (Exception ex) { Util.Log("shot: " + ex.Message); }
+        }
+
         public void OpenPanel(string name)
         {
+            if (name.StartsWith("shot|")) { SaveShot(name.Substring(5)); return; }
+            if (Util.Isolated && name.StartsWith("dbg|")) { DebugCmd(name.Substring(4)); return; }
             if (name.StartsWith("due|"))
             {
                 var dp = name.Substring(4).Split(new[] { '|' }, 2);
@@ -2523,7 +3175,8 @@ namespace AnasTick
             mode = mode == m ? Mode.List : m;
             bool list = mode == Mode.List;
             listScroll.Visibility = hairline.Visibility = addGrid.Visibility = list ? Visibility.Visible : Visibility.Collapsed;
-            panelHost.Visibility = list ? Visibility.Collapsed : Visibility.Visible;
+            panelScroll.Visibility = list ? Visibility.Collapsed : Visibility.Visible;
+            panelScroll.ScrollToTop();
             panelHost.Children.Clear();
             if (mode == Mode.Quick) BuildQuickPanel();
             else if (mode == Mode.Settings) BuildSettingsPanel();
@@ -2639,22 +3292,78 @@ namespace AnasTick
             };
             paint();
             track.MouseLeftButtonUp += delegate { v = !v; paint(); change(v); };
+            track.Tag = new Action<bool>(x => { v = x; paint(); });   // لتحديث الحالة من الخارج (بدون استدعاء change)
             return track;
         }
 
-        void AddRow(string label, FrameworkElement ctl)
+        // الإعدادات مقسّمة لمجموعات: عنوان صغير + بطاقة وحدة فيها صفوف يفصل بينها خط رفيع
+        StackPanel curCard;
+
+        void BeginSection(string title, string tip = null)
         {
-            var g = new Grid();
+            var lbl = T(title, 11, "#8CFFFFFF", true);
+            lbl.Margin = new Thickness(6, 10, 6, 4);
+            if (tip != null) lbl.ToolTip = tip;
+            panelHost.Children.Add(lbl);
+            curCard = new StackPanel();
+            panelHost.Children.Add(new Border { CornerRadius = new CornerRadius(11), Background = Util.B("#17FFFFFF"), Child = curCard });
+        }
+
+        void AddBlock(FrameworkElement el)
+        {
+            if (curCard.Children.Count > 0) curCard.Children.Add(new Border { Height = 1, Background = Util.B("#14FFFFFF"), Margin = new Thickness(11, 0, 11, 0) });
+            curCard.Children.Add(new Border { Padding = new Thickness(11, 8, 11, 8), Child = el });
+        }
+
+        void AddRow(string label, FrameworkElement ctl, string tip = null)
+        {
+            var g = new Grid { MinHeight = 24 };
             g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
             g.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
             var l = T(label, 12.5, "#E6FFFFFF");
             l.VerticalAlignment = VerticalAlignment.Center;
             l.TextWrapping = TextWrapping.NoWrap;
+            if (tip != null) g.ToolTip = tip;
             ctl.VerticalAlignment = VerticalAlignment.Center;
             Grid.SetColumn(ctl, 1);
             g.Children.Add(l);
             g.Children.Add(ctl);
-            panelHost.Children.Add(new Border { CornerRadius = new CornerRadius(11), Background = Util.B("#17FFFFFF"), Padding = new Thickness(11, 7, 11, 7), Margin = new Thickness(0, 0, 0, 5), Child = g });
+            AddBlock(g);
+        }
+
+        Button RowPill(string text, Action act)
+        {
+            var b = Pill(text, act);
+            b.Margin = new Thickness(0);
+            return b;
+        }
+
+        // زر بتأكيد: الضغطة الأولى بتغيّر النص، والثانية (خلال 3 ثواني) بتنفّذ. للأفعال اللي بتفصل أو بتمسح
+        Button ConfirmPill(string text, string confirmText, Action act)
+        {
+            Button b = null;
+            DispatcherTimer reset = null;
+            b = Pill(text, () =>
+            {
+                if (reset != null && reset.IsEnabled) { reset.Stop(); act(); return; }
+                b.Content = confirmText;
+                b.Foreground = Util.B("#FF6B60");
+                if (reset == null)
+                {
+                    reset = new DispatcherTimer { Interval = TimeSpan.FromSeconds(3) };
+                    reset.Tick += delegate { reset.Stop(); b.Content = text; b.ClearValue(Control.ForegroundProperty); };
+                }
+                reset.Stop();
+                reset.Start();
+            });
+            return b;
+        }
+
+        void RebuildSettings()
+        {
+            if (mode != Mode.Settings) return;
+            panelHost.Children.Clear();
+            BuildSettingsPanel();
         }
 
         static bool TaskExists()
@@ -2667,16 +3376,26 @@ namespace AnasTick
             catch { return false; }
         }
 
-        void SetAutostart(bool on)
+        void SetAutostart(bool on, FrameworkElement toggle)
         {
+            if (Util.Isolated)
+            {
+                Flash("وضع اختبار: ما بيغيّر التشغيل مع الجهاز");
+                ((Action<bool>)toggle.Tag)(!on);
+                return;
+            }
             Task.Run(() =>
             {
+                bool ok = false;
                 try
                 {
                     var psi = new ProcessStartInfo("powershell.exe", "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \"" + Util.P("install.ps1") + "\"" + (on ? "" : " -Remove")) { CreateNoWindow = true, UseShellExecute = false };
                     using (var pr = Process.Start(psi)) pr.WaitForExit(20000);
+                    ok = TaskExists() == on;
                 }
                 catch (Exception ex) { Util.Log("autostart: " + ex.Message); }
+                if (!ok)   // ما نجح: رجّع المفتاح للحالة الفعلية وبلّغ
+                    Dispatcher.BeginInvoke(new Action(() => { ((Action<bool>)toggle.Tag)(!on); Flash("تعذّر تغيير التشغيل مع الجهاز"); }));
             });
         }
 
@@ -2697,9 +3416,17 @@ namespace AnasTick
 
         void BuildSettingsPanel()
         {
-            var head = T("الإعدادات", 13, "#FFFFFF", true);
-            head.Margin = new Thickness(3, 0, 3, 8);
-            panelHost.Children.Add(head);
+            // عنوان + زر إغلاق واضح (قبل ما كان الرجوع بس بضغطة الترس مرة ثانية)
+            var headRow = new Grid { Margin = new Thickness(3, 0, 0, 0) };
+            headRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            headRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            var head = T("الإعدادات", 14, "#FFFFFF", true);
+            head.VerticalAlignment = VerticalAlignment.Center;
+            headRow.Children.Add(head);
+            var closeBtn = IconButton("", "إغلاق", () => SetMode(Mode.Settings));
+            Grid.SetColumn(closeBtn, 1);
+            headRow.Children.Add(closeBtn);
+            panelHost.Children.Add(headRow);
 
             string[] tones = { "bell", "digital", "soft" };
             double[] vols = { 0.35, 0.65, 1.0 };
@@ -2712,11 +3439,24 @@ namespace AnasTick
                 return best;
             };
 
-            AddRow("الصوت", Toggle(cfg.SoundOn, v => { cfg.SoundOn = v; cfg.Save(); if (v) PreviewSound(); else AlarmSound.Stop(); }));
-            AddRow("النغمة", Seg(new[] { "جرس", "رقمي", "ناعم" }, Math.Max(0, Array.IndexOf(tones, cfg.Tone)), i => { cfg.Tone = tones[i]; cfg.Save(); PreviewSound(); }));
-            AddRow("مستوى الصوت", Seg(new[] { "هادي", "متوسط", "عالي" }, nearest(vols, cfg.Volume), i => { cfg.Volume = vols[i]; cfg.Save(); PreviewSound(); }));
-            AddRow("مدة الرنين", Seg(new[] { "30 ث", "90 ث", "مفتوح" }, Math.Max(0, Array.IndexOf(rings, cfg.RingSeconds)), i => { cfg.RingSeconds = rings[i]; cfg.Save(); }));
-            AddRow("الشكل", Seg(new[] { "عادي", "زجاج" }, cfg.Style == "glass" ? 1 : 0, i => { cfg.Style = i == 1 ? "glass" : "mica"; cfg.Save(); ApplyStyle(); }));
+            // التنبيهات: تفاصيل الصوت بتظهر بس لما الصوت شغّال (أقل ازدحام)
+            BeginSection("التنبيهات");
+            AddRow("الصوت", Toggle(cfg.SoundOn, v =>
+            {
+                cfg.SoundOn = v; cfg.Save();
+                if (v) PreviewSound(); else AlarmSound.Stop();
+                Dispatcher.BeginInvoke(new Action(RebuildSettings));
+            }));
+            if (cfg.SoundOn)
+            {
+                AddRow("النغمة", Seg(new[] { "جرس", "رقمي", "ناعم" }, Math.Max(0, Array.IndexOf(tones, cfg.Tone)), i => { cfg.Tone = tones[i]; cfg.Save(); PreviewSound(); }));
+                AddRow("مستوى الصوت", Seg(new[] { "هادي", "متوسط", "عالي" }, nearest(vols, cfg.Volume), i => { cfg.Volume = vols[i]; cfg.Save(); PreviewSound(); }));
+                AddRow("مدة الرنين", Seg(new[] { "30 ث", "90 ث", "مفتوح" }, Math.Max(0, Array.IndexOf(rings, cfg.RingSeconds)), i => { cfg.RingSeconds = rings[i]; cfg.Save(); }));
+            }
+            AddRow("جرّب المنبه", RowPill("تشغيل", () => { SetMode(Mode.List); TestAlarm(); }));
+
+            BeginSection("المظهر");
+            AddRow("الشكل", Seg(new[] { "عادي", "زجاج" }, cfg.Style == "glass" ? 1 : 0, i => { cfg.Style = i == 1 ? "glass" : "mica"; cfg.Save(); ApplyStyle(); }), "الزجاج أثقل بقليل");
             AddRow("الشفافية", Seg(new[] { "خفيف", "متوسط", "غامق" }, nearest(glass, cfg.Opacity), i =>
             {
                 cfg.Opacity = glass[i];
@@ -2724,18 +3464,45 @@ namespace AnasTick
                 tint.Color = Color.FromArgb((byte)Math.Round(cfg.Opacity * 255), 0x0A, 0x0C, 0x14);
                 if (cfg.Style != "glass") SetMica();
             }));
-            AddRow("التشغيل مع الجهاز", Toggle(TaskExists(), v => SetAutostart(v)));
-            AddRow("تحديث تلقائي", Toggle(cfg.AutoUpdate, v => { cfg.AutoUpdate = v; cfg.Save(); }));
+            string[] sorts = { "due", "priority", "list" };
+            AddRow("الترتيب", Seg(new[] { "الموعد", "الأهمية", "القائمة" }, Math.Max(0, Array.IndexOf(sorts, cfg.Sort)), i => { cfg.Sort = sorts[i]; cfg.Save(); lastSig = null; Render(); }));
 
-            var wrap = new WrapPanel { Margin = new Thickness(-6, 2, 0, 0) };
-            wrap.Children.Add(Pill("تحديث", () => { SetMode(Mode.List); var _ = Refresh(true); }));
-            wrap.Children.Add(Pill("فتح TickTick", () => Util.Open("https://ticktick.com/webapp")));
-            wrap.Children.Add(Pill("فحص النسخة " + Updater.Current, () => { SetMode(Mode.List); CheckUpdate(true); }));
-            wrap.Children.Add(Pill("تجربة المنبه", () => { SetMode(Mode.List); TestAlarm(); }));
-            wrap.Children.Add(Pill("إعادة الربط", () => { SetMode(Mode.List); api.ClearToken(); needAuth = true; Render(); Connect(); }));
-            wrap.Children.Add(Pill("المكان الافتراضي", () => { st.Left = null; st.Top = null; PlaceWindow(); st.Save(); }));
-            wrap.Children.Add(Pill("خروج", ExitApp));
-            panelHost.Children.Add(wrap);
+            BeginSection("القوائم", "اضغط على قائمة لإخفائها. المخفية ما بتنجلب ولا بتنبّه");
+            BuildListsChooser();
+
+            BeginSection("السلوك");
+            // فحص المهمة المجدولة بالخلفية: قبل كانت بتجمّد الواجهة حتى 4 ثواني عند فتح الإعدادات
+            FrameworkElement autoTg = null;
+            autoTg = Toggle(false, v => SetAutostart(v, autoTg));
+            AddRow("التشغيل مع الجهاز", autoTg);
+            Task.Run(() => TaskExists()).ContinueWith(tk =>
+            {
+                if (tk.Status == TaskStatus.RanToCompletion && tk.Result)
+                    Dispatcher.BeginInvoke(new Action(() => ((Action<bool>)autoTg.Tag)(true)));
+            });
+            AddRow("تحديث تلقائي", Toggle(cfg.AutoUpdate, v => { cfg.AutoUpdate = v; cfg.Save(); }), "بيحمّل الإصدار الجديد وبيعيد التشغيل لحاله");
+            AddRow("قفل المكان والحجم", Toggle(st.Locked, v => SetLocked(v)), "بيمنع السحب وتغيير الحجم بالغلط");
+            AddRow("مكان الويدجت", RowPill("رجّعه للافتراضي", () => { st.Left = null; st.Top = null; PlaceWindow(); st.Save(); }));
+
+            BeginSection("الحساب والتطبيق");
+            var acts = new WrapPanel { Margin = new Thickness(-6, -4, 0, 0) };
+            acts.Children.Add(Pill("تحديث المهام", () => { SetMode(Mode.List); var _ = Refresh(true); }));
+            acts.Children.Add(Pill("فتح TickTick", () => Util.Open("https://ticktick.com/webapp")));
+            acts.Children.Add(Pill("فحص التحديث", () => { SetMode(Mode.List); CheckUpdate(true); }));
+            acts.Children.Add(ConfirmPill("إعادة الربط", "اضغط للتأكيد", () => { SetMode(Mode.List); api.ClearToken(); needAuth = true; Render(); Connect(); }));
+            AddBlock(acts);
+            var foot = new Grid { Margin = new Thickness(3, 12, 0, 2) };
+            foot.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            foot.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            var ver = T("مهامي  ·  الإصدار " + Updater.Current, 11, "#66FFFFFF");
+            ver.VerticalAlignment = VerticalAlignment.Center;
+            foot.Children.Add(ver);
+            var exitPill = Pill("خروج", ExitApp);
+            exitPill.Foreground = Util.B("#FF6B60");
+            exitPill.Margin = new Thickness(0);
+            Grid.SetColumn(exitPill, 1);
+            foot.Children.Add(exitPill);
+            panelHost.Children.Add(foot);
         }
 
         // الزجاج: الجزء من الخلفية المموّهة يلي تحت اللوح بالضبط
@@ -2754,6 +3521,7 @@ namespace AnasTick
             tintLayer.Visibility = sheenLayer.Visibility = glass ? Visibility.Visible : Visibility.Collapsed;
             rootBorder.CornerRadius = new CornerRadius(glass ? 22 : 12);
             rootBorder.Margin = new Thickness(glass ? 14 : 8);
+            if (gripLayer != null) gripLayer.Margin = rootBorder.Margin;
             rootBorder.BorderBrush = Util.B(glass ? "#33FFFFFF" : "#1AFFFFFF");
             rootBorder.Effect = glass ? new DropShadowEffect { BlurRadius = 20, ShadowDepth = 5, Opacity = 0.3, Color = Colors.Black } : null;
             if (glass) { if (!Glass.Loaded) Glass.Load(); }
@@ -2777,7 +3545,8 @@ namespace AnasTick
             if (w <= 1 || h <= 1) return;
             if (glassBrush == null || glassVer != Glass.Version) { glassBrush = Glass.Create(); glassVer = Glass.Version; }
             Brush want = FallbackGlass;
-            if (glassBrush != null && Glass.Place(glassBrush, new Rect((Left + mg) * m.M11, (Top + mg) * m.M22, w * m.M11, h * m.M22))) want = glassBrush;
+            var gsp = ScreenPos();
+            if (glassBrush != null && Glass.Place(glassBrush, new Rect((gsp.X + mg) * m.M11, (gsp.Y + mg) * m.M22, w * m.M11, h * m.M22))) want = glassBrush;
             if (!ReferenceEquals(rootBorder.Background, want)) rootBorder.Background = want;
         }
 
@@ -2786,6 +3555,7 @@ namespace AnasTick
             body.Visibility = st.Collapsed ? Visibility.Collapsed : Visibility.Visible;
             summary.Visibility = st.Collapsed ? Visibility.Visible : Visibility.Collapsed;
             (st.Collapsed ? (UIElement)summary : body).BeginAnimation(OpacityProperty, new DoubleAnimation(0, 1, TimeSpan.FromMilliseconds(180)));
+            UpdateGrips();
         }
 
         void ToggleCollapse()
@@ -2809,7 +3579,7 @@ namespace AnasTick
             double wait = cfg.RefreshMinutes * 60.0;
             if (failCount > 0) wait = Math.Min(wait, 20.0 * (1 << Math.Min(failCount - 1, 10)));
             if ((now - lastRefreshTry).TotalSeconds >= wait && !connecting) { var _ = Refresh(); }
-            if (cfg.AutoUpdate && !updating && tickCount >= 3 && (now - lastUpdateCheck).TotalHours >= 6) CheckUpdate(false);
+            if (cfg.AutoUpdate && !Util.Isolated && !updating && tickCount >= 3 && (now - lastUpdateCheck).TotalHours >= 6) CheckUpdate(false);
         }
 
         void OnResume()
@@ -2847,6 +3617,7 @@ namespace AnasTick
         async void CheckUpdate(bool manual)
         {
             if (updating) return;
+            if (Util.Isolated) { if (manual) Flash("وضع اختبار: التحديث معطّل"); return; }
             updating = true;
             lastUpdateCheck = DateTime.Now;
             try
@@ -2876,7 +3647,7 @@ namespace AnasTick
 
         void RestartNow()
         {
-            try { Process.Start(new ProcessStartInfo(Updater.ExePath, "--restart") { UseShellExecute = false }); }
+            try { Process.Start(new ProcessStartInfo(Updater.ExePath, Util.RestartArgs) { UseShellExecute = false }); }
             catch (Exception ex) { Util.Log("restart: " + ex.Message); return; }
             exiting = true;
             st.Save();
@@ -2887,6 +3658,7 @@ namespace AnasTick
         // ----------------------------------------------------------- الخروج
         void Cleanup()
         {
+            if (hotkeyOn) { Native.UnregisterHotKey(hwnd, HotkeyId); hotkeyOn = false; }
             Microsoft.Win32.SystemEvents.PowerModeChanged -= OnPowerModeChanged;
             Microsoft.Win32.SystemEvents.DisplaySettingsChanged -= OnDisplayChanged;
             System.Net.NetworkInformation.NetworkChange.NetworkAvailabilityChanged -= OnNetworkAvailability;
@@ -2912,7 +3684,7 @@ namespace AnasTick
             Util.Log("window closed unexpectedly, restarting");
             st.Save();
             Cleanup();
-            try { Process.Start(new ProcessStartInfo(Process.GetCurrentProcess().MainModule.FileName, "--restart") { UseShellExecute = false }); }
+            try { Process.Start(new ProcessStartInfo(Process.GetCurrentProcess().MainModule.FileName, Util.RestartArgs) { UseShellExecute = false }); }
             catch (Exception ex) { Util.Log("restart: " + ex.Message); }
             Application.Current.Shutdown();
         }
@@ -2928,6 +3700,20 @@ namespace AnasTick
         {
             bool auto = args.Contains("--auto");
             bool restart = args.Contains("--restart");
+            string dataArg = args.FirstOrDefault(a => a.StartsWith("--data="));
+            string shotArg = args.FirstOrDefault(a => a.StartsWith("--shot="));
+            string dbgArg = args.FirstOrDefault(a => a.StartsWith("--dbg="));
+            if (dataArg != null)
+            {
+                try
+                {
+                    Util.DataDir = Path.GetFullPath(dataArg.Substring(7).Trim('"'));
+                    Directory.CreateDirectory(Util.DataDir);
+                    Util.Isolated = true;
+                }
+                catch { return 2; }
+            }
+            string sfx = Util.InstanceSuffix();
             bool testAlarm = args.Contains("--test-alarm");
             string panelArg = args.FirstOrDefault(a => a.StartsWith("--panel="));
             string alarmArg = args.FirstOrDefault(a => a.StartsWith("--alarm="));
@@ -2936,10 +3722,10 @@ namespace AnasTick
             string renameArg = args.FirstOrDefault(a => a.StartsWith("--rename="));
 
             bool created;
-            var mutex = new Mutex(true, @"Local\AnasTickWidget", out created);
-            var showEvt = new EventWaitHandle(false, EventResetMode.AutoReset, @"Local\AnasTickWidget.Show");
-            var testEvt = new EventWaitHandle(false, EventResetMode.AutoReset, @"Local\AnasTickWidget.Test");
-            var panelEvt = new EventWaitHandle(false, EventResetMode.AutoReset, @"Local\AnasTickWidget.Panel");
+            var mutex = new Mutex(true, @"Local\AnasTickWidget" + sfx, out created);
+            var showEvt = new EventWaitHandle(false, EventResetMode.AutoReset, @"Local\AnasTickWidget" + sfx + ".Show");
+            var testEvt = new EventWaitHandle(false, EventResetMode.AutoReset, @"Local\AnasTickWidget" + sfx + ".Test");
+            var panelEvt = new EventWaitHandle(false, EventResetMode.AutoReset, @"Local\AnasTickWidget" + sfx + ".Panel");
             if (!created && restart)
             {
                 try { created = mutex.WaitOne(15000); }
@@ -2947,11 +3733,13 @@ namespace AnasTick
             }
             if (!created)
             {
-                if (dueArg != null) { try { File.WriteAllText(Util.P("panel.req"), "due|" + dueArg.Substring(6), new UTF8Encoding(false)); } catch { } panelEvt.Set(); }
-                else if (ringArg != null) { try { File.WriteAllText(Util.P("panel.req"), "ring|" + ringArg.Substring(7), new UTF8Encoding(false)); } catch { } panelEvt.Set(); }
-                else if (renameArg != null) { try { File.WriteAllText(Util.P("panel.req"), "rename|" + renameArg.Substring(9), new UTF8Encoding(false)); } catch { } panelEvt.Set(); }
-                else if (alarmArg != null) { try { File.WriteAllText(Util.P("panel.req"), "alarm|" + alarmArg.Substring(8), new UTF8Encoding(false)); } catch { } panelEvt.Set(); }
-                else if (panelArg != null) { try { File.WriteAllText(Util.P("panel.req"), panelArg.Substring(8)); } catch { } panelEvt.Set(); }
+                if (dueArg != null) { try { File.WriteAllText(Util.D("panel.req"), "due|" + dueArg.Substring(6), new UTF8Encoding(false)); } catch { } panelEvt.Set(); }
+                else if (ringArg != null) { try { File.WriteAllText(Util.D("panel.req"), "ring|" + ringArg.Substring(7), new UTF8Encoding(false)); } catch { } panelEvt.Set(); }
+                else if (renameArg != null) { try { File.WriteAllText(Util.D("panel.req"), "rename|" + renameArg.Substring(9), new UTF8Encoding(false)); } catch { } panelEvt.Set(); }
+                else if (alarmArg != null) { try { File.WriteAllText(Util.D("panel.req"), "alarm|" + alarmArg.Substring(8), new UTF8Encoding(false)); } catch { } panelEvt.Set(); }
+                else if (dbgArg != null && Util.Isolated) { try { File.WriteAllText(Util.D("panel.req"), "dbg|" + dbgArg.Substring(6).Trim('"'), new UTF8Encoding(false)); } catch { } panelEvt.Set(); }
+                else if (shotArg != null && Util.Isolated) { try { File.WriteAllText(Util.D("panel.req"), "shot|" + shotArg.Substring(7).Trim('"'), new UTF8Encoding(false)); } catch { } panelEvt.Set(); }
+                else if (panelArg != null) { try { File.WriteAllText(Util.D("panel.req"), panelArg.Substring(8)); } catch { } panelEvt.Set(); }
                 else if (testAlarm) testEvt.Set();       // تجربة المنبه على النسخة الشغالة
                 else if (!auto) showEvt.Set();      // تشغيل يدوي والأداة شغالة: بس نظهرها
                 return 0;
@@ -2959,10 +3747,11 @@ namespace AnasTick
 
             var state = WidgetState.Load();
             state.UserExited = false;
-            Updater.Cleanup();
+            if (!Util.Isolated) Updater.Cleanup();
             state.Save();
 
             ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12;
+            ServicePointManager.DefaultConnectionLimit = 16;   // الافتراضي 2: طلبات القوائم كانت تنتظر بالدور
 
             var app = new Application { ShutdownMode = ShutdownMode.OnExplicitShutdown };
             Widget w = null;
@@ -2993,7 +3782,7 @@ namespace AnasTick
                     app.Dispatcher.BeginInvoke(new Action(() =>
                     {
                         string req = "";
-                        try { req = File.ReadAllText(Util.P("panel.req"), Encoding.UTF8).Trim(); File.Delete(Util.P("panel.req")); } catch { }
+                        try { req = File.ReadAllText(Util.D("panel.req"), Encoding.UTF8).Trim(); File.Delete(Util.D("panel.req")); } catch { }
                         if (w != null) w.OpenPanel(req);
                     }));
                 }, null, -1, false);
