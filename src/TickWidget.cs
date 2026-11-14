@@ -46,9 +46,30 @@ namespace AnasTick
 
         public static string P(string name) { return Path.Combine(Dir, name); }
 
+        static readonly object logLock = new object();
+        static readonly Dictionary<string, DateTime> logSeen = new Dictionary<string, DateTime>();
+
+        // نفس الرسالة ما بتنكتب أكتر من مرة كل 15 دقيقة، والملف بيتدوّر عند 256KB (انقطاع النت كان بيكبّره بلا حدود)
         public static void Log(string msg)
         {
-            try { File.AppendAllText(P("error.log"), "[" + DateTime.Now.ToString("s", Inv) + "] " + msg + "\r\n", new UTF8Encoding(false)); }
+            try
+            {
+                lock (logLock)
+                {
+                    DateTime last, now = DateTime.Now;
+                    if (logSeen.TryGetValue(msg, out last) && (now - last).TotalMinutes < 15) return;
+                    if (logSeen.Count > 200) logSeen.Clear();
+                    logSeen[msg] = now;
+                    string f = P("error.log");
+                    var fi = new FileInfo(f);
+                    if (fi.Exists && fi.Length > 256 * 1024)
+                    {
+                        string old = f + ".old";
+                        try { if (File.Exists(old)) File.Delete(old); File.Move(f, old); } catch { }
+                    }
+                    File.AppendAllText(f, "[" + now.ToString("s", Inv) + "] " + msg + "\r\n", new UTF8Encoding(false));
+                }
+            }
             catch { }
         }
 
@@ -339,6 +360,7 @@ namespace AnasTick
     //  TickTick Open API
     // -----------------------------------------------------------------
     class AuthException : Exception { }
+    class NetException : Exception { public NetException(string m) : base(m) { } }   // ما في رد من السيرفر (DNS/اتصال/مهلة)
 
     class Api
     {
@@ -412,6 +434,7 @@ namespace AnasTick
             if (r != null && r.StatusCode == HttpStatusCode.Unauthorized) throw new AuthException();
             string detail = "";
             if (r != null) { try { using (var sr = new StreamReader(r.GetResponseStream())) detail = sr.ReadToEnd(); } catch { } }
+            if (r == null) throw new NetException(err.Message + " " + detail);
             throw new Exception(err.Message + " " + detail);
         }
 
@@ -441,6 +464,9 @@ namespace AnasTick
                 string txt;
                 try { txt = await job; }
                 catch (AuthException) { throw; }
+                // فشل شبكة بمشروع واحد: ما بنكمّل بقائمة ناقصة (كانت بتمسح مهام المشاريع الفاشلة من العرض والكاش)
+                catch (NetException) { throw; }
+                catch (TimeoutException) { throw; }
                 catch (Exception ex) { failed++; Util.Log("project data: " + ex.Message); continue; }
 
                 var d = Util.Json.DeserializeObject(txt) as Dictionary<string, object>;
@@ -950,7 +976,7 @@ namespace AnasTick
         bool needAuth, refreshing, connecting, exiting;
         readonly Dictionary<string, DispatcherTimer> pendingDone = new Dictionary<string, DispatcherTimer>();
         DateTime renderDay, lastTick, lastRefreshTry = DateTime.MinValue;
-        int tickCount;
+        int tickCount, failCount;
         IntPtr hwnd;
         DispatcherTimer timer, attachRetry;
         Forms.NotifyIcon tray;
@@ -1035,6 +1061,7 @@ namespace AnasTick
 
             Microsoft.Win32.SystemEvents.PowerModeChanged += OnPowerModeChanged;
             Microsoft.Win32.SystemEvents.DisplaySettingsChanged += OnDisplayChanged;
+            System.Net.NetworkInformation.NetworkChange.NetworkAvailabilityChanged += OnNetworkAvailability;
 
             Show();
             Dispatcher.BeginInvoke(new Action(Native.Trim), DispatcherPriority.ApplicationIdle);
@@ -2066,11 +2093,13 @@ namespace AnasTick
                 needAuth = false;
                 lastOk = DateTime.Now;
                 statusText = null;
+                failCount = 0;
                 SaveCache();
             }
             catch (AuthException) { api.ClearToken(); needAuth = true; }
             catch (Exception ex)
             {
+                failCount++;
                 Util.Log("refresh: " + ex.Message);
                 statusText = "غير متصل" + (lastOk != null ? " · آخر تحديث " + Util.Clock(lastOk.Value) : "") + " · اضغط للمحاولة";
             }
@@ -2683,7 +2712,10 @@ namespace AnasTick
             AttachToDesktop();   // Explorer بينقل سطح المكتب بين نوافذ بعد Win+D، فبنتأكد إنه لسا الأب الصح
             if (DateTime.Today != renderDay || tickCount % 3 == 0) Render();
             CheckAlerts();
-            if ((now - lastRefreshTry).TotalMinutes >= cfg.RefreshMinutes && !connecting) { var _ = Refresh(); }
+            // بعد فشل: إعادة محاولة سريعة بتباعد تصاعدي (20 ث، 40، 80...) لحد الفترة العادية
+            double wait = cfg.RefreshMinutes * 60.0;
+            if (failCount > 0) wait = Math.Min(wait, 20.0 * (1 << Math.Min(failCount - 1, 10)));
+            if ((now - lastRefreshTry).TotalSeconds >= wait && !connecting) { var _ = Refresh(); }
         }
 
         void OnResume()
@@ -2695,7 +2727,15 @@ namespace AnasTick
             Render();
             CheckAlerts();
             // النت بياخد كم ثانية ليرجع بعد النوم
+            failCount = 0;
             lastRefreshTry = DateTime.Now.AddMinutes(-cfg.RefreshMinutes).AddSeconds(15);
+        }
+
+        // رجع النت: تحديث بأول تك (خلال 20 ث) بدل ما ننتظر الدورة العادية
+        void OnNetworkAvailability(object s, System.Net.NetworkInformation.NetworkAvailabilityEventArgs e)
+        {
+            if (!e.IsAvailable) return;
+            Dispatcher.BeginInvoke(new Action(() => { failCount = 0; lastRefreshTry = DateTime.MinValue; }));
         }
 
         void OnPowerModeChanged(object s, Microsoft.Win32.PowerModeChangedEventArgs e)
@@ -2714,6 +2754,7 @@ namespace AnasTick
         {
             Microsoft.Win32.SystemEvents.PowerModeChanged -= OnPowerModeChanged;
             Microsoft.Win32.SystemEvents.DisplaySettingsChanged -= OnDisplayChanged;
+            System.Net.NetworkInformation.NetworkChange.NetworkAvailabilityChanged -= OnNetworkAvailability;
             CloseAlarm();
             try { timer.Stop(); } catch { }
             try { tray.Visible = false; tray.Dispose(); } catch { }

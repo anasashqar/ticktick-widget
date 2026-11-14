@@ -1,0 +1,46 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build TickWidget.exe
+        shell: cmd
+        run: build.cmd
+
+      - name: Verify output
+        shell: pwsh
+        run: |
+          if (-not (Test-Path TickWidget.exe)) { throw 'TickWidget.exe was not produced' }
+          Get-Item TickWidget.exe | Format-List Name, Length
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist/TickWidget | Out-Null
+          Copy-Item TickWidget.exe, install.cmd, install.ps1, uninstall.cmd, README.md dist/TickWidget/
+          Copy-Item sounds dist/TickWidget/sounds -Recurse
+          Compress-Archive -Path dist/TickWidget/* -DestinationPath TickWidget.zip -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TickWidget
+          path: TickWidget.zip
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ github.ref_name }}" TickWidget.zip --title "${{ github.ref_name }}" --generate-notes
