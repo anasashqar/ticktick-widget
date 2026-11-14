@@ -49,8 +49,39 @@ namespace AnasTick
 
         // ملفات البيانات (إعدادات، حالة، توكن، كاش، سجل). افتراضياً بجانب الـ exe،
         // ومع --data=<مجلد> بتروح لمجلد منفصل (للاختبار بدون لمس بياناتك الحقيقية)
-        public static string DataDir = Dir;
+        // الافتراضي: %APPDATA%\TickWidget. ملف portable.flag جنب الـ exe = البيانات جنبه (وضع محمول/تطوير).
+        // TICKWIDGET_APPDATA (للاختبار فقط) بيبدّل %APPDATA% ببديل ومعه بيتحوّل التشغيل لوضع معزول
+        public static string DataDir = ComputeDataDir();
         public static bool Isolated;
+
+        static string ComputeDataDir()
+        {
+            if (File.Exists(Path.Combine(Dir, "portable.flag"))) return Dir;
+            string env = Environment.GetEnvironmentVariable("TICKWIDGET_APPDATA");
+            string root = string.IsNullOrEmpty(env) ? Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData) : env;
+            return Path.Combine(root, "TickWidget");
+        }
+
+        // أول تشغيل بالمكان الجديد: بننسخ (مش بننقل) ملفات النسخة القديمة من جنب الـ exe، فما بتحتاج تعيد الربط
+        public static void MigrateLegacy()
+        {
+            try
+            {
+                if (DataDir == Dir) return;
+                Directory.CreateDirectory(DataDir);
+                string marker = D("migrated.flag");
+                if (File.Exists(marker)) return;
+                var copied = new List<string>();
+                foreach (var n in new[] { "settings.json", "state.json", "token.dat", "cache.json", "projects.json", "secret.dat" })
+                {
+                    string src = P(n), dst = D(n);
+                    if (File.Exists(src) && !File.Exists(dst)) { try { File.Copy(src, dst); copied.Add(n); } catch (Exception ex) { Log("migrate " + n + ": " + ex.Message); } }
+                }
+                File.WriteAllText(marker, DateTime.Now.ToString("s", Inv));
+                Log("migrated to " + DataDir + ": " + (copied.Count == 0 ? "(nothing to copy)" : string.Join(", ", copied)));
+            }
+            catch (Exception ex) { Log("migrate: " + ex.Message); }
+        }
         public static string D(string name) { return Path.Combine(DataDir, name); }
         public static string RestartArgs { get { return "--restart" + (Isolated ? " \"--data=" + DataDir + "\"" : ""); } }
 
@@ -477,6 +508,65 @@ namespace AnasTick
     //  TickTick Open API
     // -----------------------------------------------------------------
     class ProjInfo { public string Id, Name, Color; }
+
+    // -----------------------------------------------------------------
+    //  بيانات تطبيق المطوّر (client_id / client_secret): مشفّرة DPAPI بمستخدم ويندوز، بدل ملف نصي
+    // -----------------------------------------------------------------
+    class Secret { public string Id, Key; }
+
+    static class SecretStore
+    {
+        static string Path_ { get { return Util.D("secret.dat"); } }
+
+        public static Secret Load()
+        {
+            try
+            {
+                if (File.Exists(Path_))
+                {
+                    string txt = Encoding.UTF8.GetString(ProtectedData.Unprotect(File.ReadAllBytes(Path_), null, DataProtectionScope.CurrentUser));
+                    var d = Util.Json.DeserializeObject(txt) as Dictionary<string, object>;
+                    var s = new Secret { Id = Util.S(d, "id"), Key = Util.S(d, "key") };
+                    if (!string.IsNullOrEmpty(s.Id) && !string.IsNullOrEmpty(s.Key)) return s;
+                }
+            }
+            catch (Exception ex) { Util.Log("secret read: " + ex.Message); }
+            return LoadLegacy();
+        }
+
+        // الملف النصي القديم ticktick.secret.json: بنقرأه مرة وبنحوّله لمشفّر. النسخة اللي بمجلد البيانات بتنمسح، واللي جنب الـ exe بنتركها لقرارك
+        static Secret LoadLegacy()
+        {
+            foreach (string f in new[] { Util.D("ticktick.secret.json"), Util.P("ticktick.secret.json") })
+            {
+                try
+                {
+                    if (!File.Exists(f)) continue;
+                    var d = Util.Json.DeserializeObject(File.ReadAllText(f, Encoding.UTF8)) as Dictionary<string, object>;
+                    var s = new Secret { Id = Util.S(d, "client_id"), Key = Util.S(d, "client_secret") };
+                    if (string.IsNullOrEmpty(s.Id) || string.IsNullOrEmpty(s.Key)) continue;
+                    Save(s.Id, s.Key);
+                    if (Util.DataDir != Util.Dir && string.Equals(Path.GetFullPath(f), Path.GetFullPath(Util.D("ticktick.secret.json")), StringComparison.OrdinalIgnoreCase))
+                        try { File.Delete(f); } catch { }
+                    return s;
+                }
+                catch (Exception ex) { Util.Log("secret legacy: " + ex.Message); }
+            }
+            return null;
+        }
+
+        public static void Save(string id, string key)
+        {
+            Directory.CreateDirectory(Util.DataDir);
+            string json = Util.Json.Serialize(new Dictionary<string, object> { { "id", id }, { "key", key } });
+            File.WriteAllBytes(Path_, ProtectedData.Protect(Encoding.UTF8.GetBytes(json), null, DataProtectionScope.CurrentUser));
+        }
+
+        public static void Clear()
+        {
+            try { File.Delete(Path_); } catch { }
+        }
+    }
 
     class AuthException : Exception { }
     class NetException : Exception { public NetException(string m) : base(m) { } }   // ما في رد من السيرفر (DNS/اتصال/مهلة)
@@ -1184,7 +1274,8 @@ namespace AnasTick
         StackPanel alertsPanel, listPanel, body;
         TextBox newBox;
         Button btnQuick, btnSettings;
-        enum Mode { List, Quick, Settings }
+        enum Mode { List, Quick, Settings, Setup }
+        bool? secretOk;   // بيانات تطبيق المطوّر موجودة؟ (بنخزّنها لأن Render بينادى كتير)
         Mode mode = Mode.List;
         StackPanel panelHost;
         ScrollViewer listScroll;
@@ -1793,7 +1884,8 @@ namespace AnasTick
                 if (needAuth)
                 {
                     var card = new StackPanel { Margin = new Thickness(4, 2, 4, 10) };
-                    card.Children.Add(T("اربط حساب TickTick", 12, "#D9FFFFFF"));
+                    if (secretOk == null) secretOk = SecretStore.Load() != null;
+                    card.Children.Add(T(secretOk == false ? "أدخل بيانات تطبيق TickTick (مرة وحدة) عشان تربط" : "اربط حساب TickTick", 12, "#D9FFFFFF"));
                     var wp = new WrapPanel();
                     wp.Children.Add(Pill(connecting ? "بانتظار المتصفح..." : "ربط", Connect));
                     card.Children.Add(wp);
@@ -2477,20 +2569,6 @@ namespace AnasTick
         string lastCacheText;
 
         // ----------------------------------------------------------- الربط (OAuth)
-        class Secret { public string Id, Key; }
-
-        static Secret LoadSecret()
-        {
-            try
-            {
-                var d = Util.Json.DeserializeObject(File.ReadAllText(Util.D("ticktick.secret.json"), Encoding.UTF8)) as Dictionary<string, object>;
-                var s = new Secret { Id = Util.S(d, "client_id"), Key = Util.S(d, "client_secret") };
-                if (string.IsNullOrEmpty(s.Id) || string.IsNullOrEmpty(s.Key)) return null;
-                return s;
-            }
-            catch { return null; }
-        }
-
         static void Reply(HttpListenerContext ctx, bool ok)
         {
             string msg = ok ? "تم الربط، ارجع للويدجت" : "ما زبط الربط، جرّب كمان مرة";
@@ -2511,8 +2589,8 @@ namespace AnasTick
         async void Connect()
         {
             if (connecting) return;
-            var sec = LoadSecret();
-            if (sec == null) { statusText = "ملف ticktick.secret.json ناقص"; needAuth = false; Render(); return; }
+            var sec = SecretStore.Load();
+            if (sec == null) { if (mode != Mode.Setup) SetMode(Mode.Setup); return; }   // مش مدخّل بيانات التطبيق: بنفتح شاشة الإدخال
             connecting = true;
             needAuth = true;
             Render();
@@ -3152,7 +3230,7 @@ namespace AnasTick
                 if (rt != null) CommitRename(rt, parts[1]);
                 return;
             }
-            Mode want = name == "quick" ? Mode.Quick : name == "settings" ? Mode.Settings : Mode.List;
+            Mode want = name == "quick" ? Mode.Quick : name == "settings" ? Mode.Settings : name == "setup" ? Mode.Setup : Mode.List;
             if (want == Mode.List) { if (mode != Mode.List) SetMode(mode); return; }
             if (mode != want) SetMode(want);
         }
@@ -3180,6 +3258,7 @@ namespace AnasTick
             panelHost.Children.Clear();
             if (mode == Mode.Quick) BuildQuickPanel();
             else if (mode == Mode.Settings) BuildSettingsPanel();
+            else if (mode == Mode.Setup) BuildSetupPanel();
             SetActive(btnQuick, mode == Mode.Quick);
             SetActive(btnSettings, mode == Mode.Settings);
             if (st.Collapsed && !list) { st.Collapsed = false; ApplyCollapse(); st.Save(); }
@@ -3414,6 +3493,82 @@ namespace AnasTick
             previewTimer.Start();
         }
 
+        // شاشة إدخال بيانات تطبيق المطوّر (client_id / client_secret): مرة وحدة، بتنحفظ مشفّرة
+        void BuildSetupPanel()
+        {
+            var old = SecretStore.Load();
+            secretOk = old != null;
+
+            var headRow = new Grid { Margin = new Thickness(3, 0, 0, 4) };
+            headRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            headRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            var head = T("بيانات ربط TickTick", 14, "#FFFFFF", true);
+            head.VerticalAlignment = VerticalAlignment.Center;
+            headRow.Children.Add(head);
+            var closeBtn = IconButton("", "إغلاق", () => SetMode(Mode.Setup));
+            Grid.SetColumn(closeBtn, 1);
+            headRow.Children.Add(closeBtn);
+            panelHost.Children.Add(headRow);
+
+            var note = T("مرة وحدة: افتح صفحة المطوّر، أنشئ تطبيق، وحط هالرابط بخانة OAuth redirect URL، وبعدها الصق القيمتين هون.", 11.5, "#B3FFFFFF");
+            note.Margin = new Thickness(3, 0, 3, 8);
+            panelHost.Children.Add(note);
+
+            var urlRow = new Grid { Margin = new Thickness(0, 0, 0, 6) };
+            urlRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            urlRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            var url = T(Api.Redirect, 11.5, "#FFFFFFFF");
+            url.FlowDirection = FlowDirection.LeftToRight;
+            url.TextWrapping = TextWrapping.NoWrap;
+            url.VerticalAlignment = VerticalAlignment.Center;
+            url.Margin = new Thickness(10, 0, 8, 0);
+            urlRow.Children.Add(url);
+            var copy = RowPill("نسخ", () => { try { Clipboard.SetText(Api.Redirect); Flash("اننسخ الرابط"); } catch { } });
+            Grid.SetColumn(copy, 1);
+            urlRow.Children.Add(copy);
+            panelHost.Children.Add(new Border { CornerRadius = new CornerRadius(11), Background = Util.B("#17FFFFFF"), Padding = new Thickness(0, 6, 8, 6), Child = urlRow });
+
+            TextBox idBox;
+            var idCard = FieldCard("Client ID", out idBox);
+            idBox.FlowDirection = FlowDirection.LeftToRight;
+            if (old != null) idBox.Text = old.Id;
+            panelHost.Children.Add(new Border { CornerRadius = new CornerRadius(11), Background = Util.B("#17FFFFFF"), Margin = new Thickness(0, 0, 0, 6), Child = idCard });
+
+            var pw = new PasswordBox { Foreground = Brushes.White, CaretBrush = Brushes.White, Background = Brushes.Transparent, BorderThickness = new Thickness(0), Padding = new Thickness(8, 7, 8, 7), FontSize = 12, FlowDirection = FlowDirection.LeftToRight };
+            var pwHint = T(old != null ? "Client Secret (محفوظ، اتركه فاضي للإبقاء)" : "Client Secret", 12, "#80FFFFFF");
+            pwHint.IsHitTestVisible = false;
+            pwHint.VerticalAlignment = VerticalAlignment.Center;
+            pwHint.Margin = new Thickness(9, 0, 9, 0);
+            pwHint.TextWrapping = TextWrapping.NoWrap;
+            pwHint.TextTrimming = TextTrimming.CharacterEllipsis;
+            pw.PasswordChanged += delegate { pwHint.Visibility = pw.Password.Length == 0 ? Visibility.Visible : Visibility.Collapsed; };
+            var pwGrid = new Grid();
+            pwGrid.Children.Add(pw);
+            pwGrid.Children.Add(pwHint);
+            panelHost.Children.Add(new Border { CornerRadius = new CornerRadius(11), Background = Util.B("#17FFFFFF"), Child = pwGrid });
+
+            var msg = T("", 11.5, "#FF6B60");
+            msg.Margin = new Thickness(4, 6, 4, 0);
+            panelHost.Children.Add(msg);
+
+            Action save = () =>
+            {
+                string id = idBox.Text.Trim(), key = pw.Password.Trim();
+                if (key.Length == 0 && old != null) key = old.Key;
+                if (id.Length == 0 || key.Length == 0) { msg.Text = "اكتب القيمتين"; return; }
+                try { SecretStore.Save(id, key); }
+                catch (Exception ex) { msg.Text = "ما انحفظ: " + ex.Message; return; }
+                secretOk = true;
+                SetMode(Mode.Setup);                                  // رجوع للقائمة
+                api.ClearToken(); needAuth = true; Render(); Connect();
+            };
+            var pills = new WrapPanel { Margin = new Thickness(-6, 2, 0, 0) };
+            pills.Children.Add(Pill("حفظ وربط", save));
+            pills.Children.Add(Pill("فتح صفحة المطوّر", () => Util.Open("https://developer.ticktick.com/manage")));
+            if (old != null) pills.Children.Add(ConfirmPill("حذف البيانات", "اضغط للتأكيد", () => { SecretStore.Clear(); api.ClearToken(); secretOk = false; needAuth = true; SetMode(Mode.Setup); }));
+            panelHost.Children.Add(pills);
+        }
+
         void BuildSettingsPanel()
         {
             // عنوان + زر إغلاق واضح (قبل ما كان الرجوع بس بضغطة الترس مرة ثانية)
@@ -3489,6 +3644,7 @@ namespace AnasTick
             acts.Children.Add(Pill("تحديث المهام", () => { SetMode(Mode.List); var _ = Refresh(true); }));
             acts.Children.Add(Pill("فتح TickTick", () => Util.Open("https://ticktick.com/webapp")));
             acts.Children.Add(Pill("فحص التحديث", () => { SetMode(Mode.List); CheckUpdate(true); }));
+            acts.Children.Add(Pill("بيانات الربط", () => SetMode(Mode.Setup)));
             acts.Children.Add(ConfirmPill("إعادة الربط", "اضغط للتأكيد", () => { SetMode(Mode.List); api.ClearToken(); needAuth = true; Render(); Connect(); }));
             AddBlock(acts);
             var foot = new Grid { Margin = new Thickness(3, 12, 0, 2) };
@@ -3713,6 +3869,7 @@ namespace AnasTick
                 }
                 catch { return 2; }
             }
+            if (dataArg == null && !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("TICKWIDGET_APPDATA"))) Util.Isolated = true;   // اختبار الترحيل بدون لمس %APPDATA% الحقيقي
             string sfx = Util.InstanceSuffix();
             bool testAlarm = args.Contains("--test-alarm");
             string panelArg = args.FirstOrDefault(a => a.StartsWith("--panel="));
@@ -3745,6 +3902,7 @@ namespace AnasTick
                 return 0;
             }
 
+            if (dataArg == null) { Util.MigrateLegacy(); SecretStore.Load(); }   // التحويل المبكر لسر مشفّر (لو كان بملف نصي قديم)
             var state = WidgetState.Load();
             state.UserExited = false;
             if (!Util.Isolated) Updater.Cleanup();

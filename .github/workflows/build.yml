@@ -10,6 +10,8 @@ on:
       - 'sounds/**'
       - 'app.manifest'
       - 'build.cmd'
+      - 'install.ps1'
+      - 'installer/**'
       - '.github/workflows/build.yml'
   workflow_dispatch:
 
@@ -49,10 +51,21 @@ jobs:
           Copy-Item sounds dist/TickWidget/sounds -Recurse
           Compress-Archive -Path dist/TickWidget/* -DestinationPath TickWidget.zip -Force
 
+      - name: Installer (Inno Setup)
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          $iscc = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path $iscc)) { throw "ISCC not found at $iscc" }
+          & $iscc "/DAppVersion=${{ steps.ver.outputs.version }}" installer\TickWidget.iss
+          if ($LASTEXITCODE -ne 0) { throw 'ISCC failed' }
+          Move-Item Output\TickWidget-Setup.exe TickWidget-Setup.exe
+
       - uses: actions/upload-artifact@v4
         with:
           name: TickWidget
           path: |
+            TickWidget-Setup.exe
             TickWidget.zip
             TickWidget.exe
             TickWidget.exe.sha256
@@ -63,4 +76,4 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $v = "v${{ steps.ver.outputs.version }}"
-          gh release create $v TickWidget.exe TickWidget.exe.sha256 TickWidget.zip --target "${{ github.sha }}" --title $v --generate-notes --latest
+          gh release create $v TickWidget-Setup.exe TickWidget.exe TickWidget.exe.sha256 TickWidget.zip --target "${{ github.sha }}" --title $v --generate-notes --latest

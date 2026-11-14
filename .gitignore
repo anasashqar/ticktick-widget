@@ -7,3 +7,5 @@ error.log
 TickWidget.exe
 attachments/
 firebase-debug.log
+Output/
+projects.json
