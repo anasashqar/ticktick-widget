@@ -5,8 +5,8 @@
 المستخدم بيحب الردود بالعربي، مختصرة، وبسيطة. لا push ولا حذف ولا شي نهائي بدون موافقته.
 
 ## قواعد صارمة
-- **ما تلمس بياناته الحقيقية**: `token.dat`, `ticktick.secret.json`, `state.json`, `cache.json`, `settings.json` بمجلد المشروع. ما تقرأ التوكن ولا السر.
-- **النسخة الحقيقية شغّالة** من `D:\Projects\ticktick-widget\TickWidget.exe`. لا تشغّل `build.cmd` من هون (بيكتب فوق الـ exe المقفول) ولا توقف عملية `TickWidget` اللي مسارها هون. ابنِ لمجلد temp.
+- **ما تلمس بياناته الحقيقية**: `%APPDATA%\TickWidget\*` (`token.dat`, `secret.dat`, `state.json`, `cache.json`, `settings.json`)، وكمان النسخ القديمة بمجلد المشروع (`token.dat`, `ticktick.secret.json`...) لحد ما المستخدم يوافق على مسحها. ما تقرأ التوكن ولا السر.
+- **النسخة الحقيقية مثبّتة** (منذ 2026-11-14، v1.0.4 عبر المثبّت) بـ `%LOCALAPPDATA%\Programs\TickWidget\TickWidget.exe`، ومهمة التشغيل التلقائي `AnasTickWidget` بتشير لها. لا توقف عملية `TickWidget` اللي مسارها هناك ولا تشغّل المثبّت بدون `/SKIPKILL=1` للاختبار. ما تشغّل `build.cmd` من مجلد المشروع إلا بعد تأكد (بيكتب `TickWidget.exe` جنبه؛ مش خطر على المثبّتة). ابنِ للاختبار لمجلد temp.
 - **لا لقطة شاشة كاملة** أبداً (التقطت مرة محادثة خاصة). الصور من الويدجت نفسه عبر `--shot`.
 - C# 5 فقط (compiler قديم): بدون `?.` و`$"..."` و`nameof` و expression-bodied members.
 
@@ -35,7 +35,7 @@ Start-Process "$t\bin\TickWidget.exe" -ArgumentList "--data=`"$t\data`""     # �
 
 ## الحالة (2026-11-14)
 - **المرحلة 1 خلصت** (v1.0.3): قفل/حجم/تلصّق، قوائم وترتيب، اختصار عام `Ctrl+Shift+U`، إضافة `#قائمة`، تحويل إحداثيات الشاشات، إعدادات مجمّعة وقابلة للتمرير، تخفيفات أداء.
-- **المرحلة 2 (الكود جاهز، بانتظار push والتحقق من المثبّت بالـ CI):** بيانات بـ `%APPDATA%\TickWidget` (`Util.DataDir`، أو جنب الـ exe مع `portable.flag`) + نسخ تلقائي من القديم (`Util.MigrateLegacy`)؛ شاشة ربط `Mode.Setup` وسر مشفّر `SecretStore` (`secret.dat`)؛ مثبّت `installer/TickWidget.iss` بيتبنى بالـ workflow (choco install innosetup) ويطلع `TickWidget-Setup.exe` بالـ Release.
+- **المرحلة 2 خلصت (v1.0.4، 2026-11-14):** المثبّت اتبنى بالـ CI واتجرّب تثبيت وإزالة صامتين بمجلد مؤقت (ملفات، اختصار، سجل: كلها بتنزال نظيفة، ومهمة التشغيل التلقائي الحقيقية ما تأثرت). **اتثبّت رسمياً عند المستخدم**: البيانات اتنقلت (نسخ) لـ `%APPDATA%\TickWidget`، والـ exe بـ `%LOCALAPPDATA%\Programs\TickWidget`. ملفات `D:\Projects\ticktick-widget` القديمة (توكن، سر نصي، إلخ، و`TickWidget.exe`) وكمان `D:\Projects\TickWidget.exe.backup-v1.0.3` **لسا موجودة**: بتنمسح بس بموافقته. التفاصيل: بيانات بـ `%APPDATA%\TickWidget` (`Util.DataDir`، أو جنب الـ exe مع `portable.flag`) + نسخ تلقائي من القديم (`Util.MigrateLegacy`)؛ شاشة ربط `Mode.Setup` وسر مشفّر `SecretStore` (`secret.dat`)؛ مثبّت `installer/TickWidget.iss` بيتبنى بالـ workflow (choco install innosetup) ويطلع `TickWidget-Setup.exe` بالـ Release.
   - اختبار الترحيل بدون لمس الحقيقي: انسخ الـ exe لمجلد مؤقت مع ملفات بيانات وهمية، وشغّله مع `$env:TICKWIDGET_APPDATA="<temp>\appdata"` (بيحوّله لوضع معزول). مثبّت: `TickWidget-Setup.exe /VERYSILENT /SKIPKILL=1 /DIR=<temp> /TASKS=""` (بدون `/SKIPKILL=1` بيقتل أي `TickWidget.exe` شغّال!).
   - بعد أول Release فيه الترحيل: نسخة المستخدم بتتحدث لحالها وبتنسخ بياناتها لـ AppData. الملفات القديمة وملف `ticktick.secret.json` النصي بمجلد المشروع بتضل لحد ما المستخدم يوافق على مسحها.
 - **المرحلة 3:** تطبيق أندرويد Kotlin (ويدجت خفيف، RemoteViews) + Firebase للمزامنة. الخطة الكاملة: `C:\Users\sa\.claude\plans\curious-knitting-volcano.md`. نمط البناء/التوقيع منسوخ من `anasashqar/daftar` (`.github/workflows/android.yml`).
